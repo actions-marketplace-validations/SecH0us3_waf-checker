@@ -8,8 +8,44 @@ import {
 	generateEncodedPayloads,
 } from './advanced-payloads';
 import { HTTPManipulationOptions, HTTPManipulator } from './http-manipulation';
-import { isValidTargetUrl } from './utils/security';
+import { isValidTargetUrl, isInScopeRedirect } from './utils/security';
 import { substitutePayload, processCustomHeaders, randomUppercase, redactHeaders, redactUrl } from './utils/payload-utils';
+import { AuditResultItem, CheckResultEnvelope, UserAgentBypassInfo } from './reports/types';
+import { LegitUserAgent, resolveLegitUserAgents } from './payloads-data/legit-user-agents';
+
+/**
+ * Replays a request that the WAF blocked (403) under a set of legitimate,
+ * commonly allow-listed User-Agents (Googlebot, Slackbot, ...). If any of them
+ * turns the block into a non-blocked response, the WAF is trusting the
+ * User-Agent header — a real bypass worth surfacing.
+ *
+ * `reissue` re-issues the exact same request but with the given User-Agent
+ * header injected/overridden; the caller owns the request shape so this works
+ * uniformly for param, file and header checks.
+ */
+async function probeUserAgentBypass(
+	reissue: (userAgent: string) => Promise<any>,
+	legitUserAgents: LegitUserAgent[],
+	detection: WAFDetectionResult | undefined,
+	probedPayload: string | undefined,
+): Promise<UserAgentBypassInfo> {
+	const info: UserAgentBypassInfo = { bypassed: false, tested: legitUserAgents.length, hits: [] };
+	for (const ua of legitUserAgents) {
+		let res: any;
+		try {
+			res = await reissue(ua.userAgent);
+		} catch {
+			continue;
+		}
+		const status = res ? res.status : 'ERR';
+		const { blocked, verdict } = evaluateWAFVerdict(status, res?.bodyText || '', detection, res?.response?.headers, probedPayload);
+		if (!blocked) {
+			info.bypassed = true;
+			info.hits.push({ name: ua.name, userAgent: ua.userAgent, status, verdict: verdict as 'passed' | 'exposed' });
+		}
+	}
+	return info;
+}
 
 // Вспомогательная функция для отправки запроса с нужным методом и payload
 export async function sendRequest(
@@ -22,7 +58,7 @@ export async function sendRequest(
 	useEnhancedPayloads: boolean = false,
 	detectedWAF?: string,
 	httpManipulation?: HTTPManipulationOptions,
-	options?: { fetch?: typeof fetch; color?: boolean; quiet?: boolean },
+	options?: { fetch?: typeof fetch; color?: boolean; quiet?: boolean; rawPayload?: boolean; allowLocal?: boolean },
 ) {
 	const fetchFn = options?.fetch || globalThis.fetch;
 	try {
@@ -44,10 +80,10 @@ export async function sendRequest(
 		let finalUrl = url;
 		if (finalPayload !== undefined) {
 			if (url.includes('{PAYLOAD}')) {
-				finalUrl = url.replace(/\{PAYLOAD\}/g, encodeURIComponent(finalPayload));
+				finalUrl = url.replace(/\{PAYLOAD\}/g, options?.rawPayload ? finalPayload : encodeURIComponent(finalPayload));
 			} else if (method === 'GET' || method === 'DELETE') {
 				const separator = url.includes('?') ? '&' : '?';
-				if (finalPayload.startsWith('junk=')) {
+				if (finalPayload.startsWith('junk=') || options?.rawPayload) {
 					finalUrl = url + `${separator}${finalPayload}`;
 				} else {
 					finalUrl = url + `${separator}test=${encodeURIComponent(finalPayload)}`;
@@ -56,9 +92,9 @@ export async function sendRequest(
 		}
 
 		// Validate finalUrl after substitution to prevent SSRF
-		if (!isValidTargetUrl(finalUrl)) {
+		if (!isValidTargetUrl(finalUrl, { allowLocal: options?.allowLocal })) {
 			console.error(`Blocked SSRF attempt to: ${redactUrl(finalUrl)}`);
-			return { status: 'BLOCKED', is_redirect: false, responseTime: 0 };
+			return { status: 'BLOCKED', is_redirect: false, responseTime: 0, error: 'ssrf_blocked', bodyText: '' };
 		}
 
 		const controller = new AbortController();
@@ -84,7 +120,7 @@ export async function sendRequest(
 					const newHeaders = new Headers(currentHeaders || {});
 					newHeaders.set('Content-Type', 'application/json');
 					currentHeaders = newHeaders;
-				} else if (finalPayload?.startsWith('junk=')) {
+				} else if (finalPayload?.startsWith('junk=') || options?.rawPayload) {
 					currentBody = finalPayload;
 					const newHeaders = new Headers(currentHeaders || {});
 					if (!newHeaders.has('Content-Type')) {
@@ -115,9 +151,14 @@ export async function sendRequest(
 					if (!location) break;
 
 					const nextUrl = new URL(location, currentUrl).toString();
-					if (!isValidTargetUrl(nextUrl)) {
+					if (!isValidTargetUrl(nextUrl, { allowLocal: options?.allowLocal })) {
 						console.error(`Blocked SSRF redirect attempt to: ${redactUrl(nextUrl)}`);
-						return { status: 'BLOCKED', is_redirect: true, responseTime: Date.now() - startTime };
+						return { status: 'BLOCKED', is_redirect: true, responseTime: Date.now() - startTime, error: 'ssrf_blocked', bodyText: '' };
+					}
+					// Leaving the target's own domain means the response would describe some
+					// other host, so stop here and report the redirect itself.
+					if (!isInScopeRedirect(currentUrl, nextUrl)) {
+						break;
 					}
 
 					const status = resp.status;
@@ -171,19 +212,278 @@ export async function sendRequest(
 			console.log(logMsg);
 		}
 
+		let bodyText = '';
+		try {
+			const clone = resp.clone();
+			bodyText = await clone.text();
+		} catch {}
+
 		return {
 			status: resp.status,
 			is_redirect: resp.status >= 300 && resp.status < 400,
 			responseTime,
 			response: resp,
+			bodyText,
+			error: null,
 		};
-	} catch (e) {
+	} catch (e: any) {
 		console.error(`Request error for ${redactUrl(url)}:`, e);
-		return { status: 'ERR', is_redirect: false, responseTime: 0 };
+		let errorType = 'network_error';
+		if (e && (e.name === 'AbortError' || e.message?.toLowerCase().includes('aborted') || e.message?.toLowerCase().includes('timeout'))) {
+			errorType = 'timeout';
+		} else if (e && (e.code === 'ENOTFOUND' || e.message?.toLowerCase().includes('dns') || e.message?.toLowerCase().includes('getaddrinfo'))) {
+			errorType = 'dns';
+		} else if (e && (e.code === 'ECONNRESET' || e.message?.toLowerCase().includes('reset'))) {
+			errorType = 'connection_reset';
+		}
+		return { status: 'ERR', is_redirect: false, responseTime: 0, error: errorType, bodyText: '' };
 	}
 }
 
-export async function handleApiCheckFiltered(
+/**
+ * Checks whether a response body plausibly matches the expected content of a requested artifact.
+ * Prevents SPAs and frameworks that return 200 with an HTML shell for unknown paths from being
+ * falsely classified as 'exposed'.
+ */
+export function isPlausibleArtifactContent(bodyText: string, probedPayload?: string): boolean {
+	if (!bodyText || bodyText.trim().length === 0) {
+		return false;
+	}
+
+	const trimmed = bodyText.trimStart();
+	const isHtml = /^(?:<!doctype\s+html|<html[\s>])/i.test(trimmed);
+
+	const cleanTarget = probedPayload ? probedPayload.split(/[?#]/)[0].trim().toLowerCase() : '';
+	const filename = cleanTarget.split('/').pop() || cleanTarget;
+	const isHtmlTarget = filename.endsWith('.html') || filename.endsWith('.htm');
+
+	// If the response is an HTML document but the requested artifact is not an HTML file,
+	// it's an SPA shell, custom 404-as-200 page, or generic application HTML — not a leak.
+	if (isHtml && !isHtmlTarget) {
+		return false;
+	}
+
+	// 1. .env files
+	if (filename === '.env' || filename.startsWith('.env.') || filename.endsWith('.env')) {
+		return !isHtml && /^[A-Z_][A-Z0-9_]*=/m.test(bodyText);
+	}
+
+	// 2. .git/config
+	if (cleanTarget.endsWith('.git/config') || (filename === 'config' && cleanTarget.includes('.git'))) {
+		return !isHtml && bodyText.includes('[core]');
+	}
+
+	// 3. .git/HEAD
+	if (cleanTarget.endsWith('.git/head') || (filename === 'head' && cleanTarget.includes('.git'))) {
+		return !isHtml && /^ref:\s*refs\//m.test(bodyText);
+	}
+
+	// 4. Other .git paths (.git directory, .git/index, etc.)
+	if (cleanTarget === '.git' || cleanTarget.endsWith('/.git')) {
+		return !isHtml && (bodyText.includes('[core]') || /^ref:\s*refs\//m.test(bodyText) || bodyText.startsWith('DIRC'));
+	}
+
+	// 5. composer.json / package.json and lockfiles
+	if (filename === 'package.json') {
+		if (isHtml) return false;
+		try {
+			const parsed = JSON.parse(bodyText);
+			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+				const expectedKeys = [
+					'name',
+					'version',
+					'dependencies',
+					'devDependencies',
+					'scripts',
+					'main',
+					'description',
+					'author',
+					'license',
+					'repository',
+				];
+				return expectedKeys.some((k) => k in parsed);
+			}
+		} catch {
+			return false;
+		}
+		return false;
+	}
+
+	if (filename === 'composer.json') {
+		if (isHtml) return false;
+		try {
+			const parsed = JSON.parse(bodyText);
+			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+				const expectedKeys = ['name', 'require', 'require-dev', 'description', 'autoload', 'type', 'license', 'authors'];
+				return expectedKeys.some((k) => k in parsed);
+			}
+		} catch {
+			return false;
+		}
+		return false;
+	}
+
+	if (filename === 'package-lock.json' || filename === 'composer.lock') {
+		if (isHtml) return false;
+		try {
+			const parsed = JSON.parse(bodyText);
+			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+				return 'packages' in parsed || 'dependencies' in parsed || 'lockfileVersion' in parsed;
+			}
+		} catch {
+			return false;
+		}
+		return false;
+	}
+
+	// 6. .sql dumps
+	if (filename.endsWith('.sql')) {
+		return !isHtml && /(?:CREATE\s+TABLE|INSERT\s+INTO)/i.test(bodyText);
+	}
+
+	// 7. Archives (.zip, .tar.gz, .tgz, .tar, .gz, .7z, .rar, .bz2, .xz, .bak)
+	if (filename.endsWith('.zip') || filename.endsWith('.war')) {
+		return !isHtml && (bodyText.includes('PK\x03\x04') || bodyText.includes('PK\x05\x06') || bodyText.includes('PK\x07\x08'));
+	}
+	if (filename.endsWith('.tar.gz') || filename.endsWith('.tgz') || filename.endsWith('.gz')) {
+		return !isHtml && bodyText.includes('\x1f\x8b');
+	}
+	if (filename.endsWith('.7z')) {
+		return !isHtml && bodyText.includes('7z\xbc\xaf\x27\x1c');
+	}
+	if (filename.endsWith('.tar')) {
+		return !isHtml && bodyText.includes('ustar');
+	}
+	if (filename.endsWith('.bak')) {
+		return (
+			!isHtml &&
+			(bodyText.includes('PK\x03\x04') ||
+				bodyText.includes('\x1f\x8b') ||
+				/(?:CREATE\s+TABLE|INSERT\s+INTO)/i.test(bodyText) ||
+				/^[A-Z_][A-Z0-9_]*=/m.test(bodyText) ||
+				bodyText.includes('[core]'))
+		);
+	}
+
+	// 8. .htaccess / .htpasswd
+	if (filename === '.htaccess') {
+		return (
+			!isHtml &&
+			/(?:RewriteEngine|RewriteRule|RewriteCond|Options|AuthType|Require|Order\s+(?:allow,deny|deny,allow)|Deny\s+from|Allow\s+from)/i.test(
+				bodyText
+			)
+		);
+	}
+	if (filename === '.htpasswd') {
+		return !isHtml && /^[a-zA-Z0-9_.-]+:(?:\$|\{SHA\}|[a-zA-Z0-9./]{13})/m.test(bodyText);
+	}
+
+	// 9. Crypto keys / certs
+	if (filename === 'id_rsa' || filename.endsWith('.pem') || filename.endsWith('.key') || filename.endsWith('.crt')) {
+		return !isHtml && /-----BEGIN [A-Z0-9 ]+-----/.test(bodyText);
+	}
+	if (filename === 'id_rsa.pub') {
+		return !isHtml && /^ssh-(?:rsa|ed25519|dss)\s+/m.test(bodyText);
+	}
+
+	// 10. PHP configs
+	if (filename === 'wp-config.php') {
+		return !isHtml && /(?:DB_NAME|DB_USER|DB_PASSWORD|table_prefix|AUTH_KEY|SECURE_AUTH_KEY)/i.test(bodyText);
+	}
+	if (filename === 'config.php') {
+		return !isHtml && /(?:<\?php|\$config|\$_CONFIG|db_password|database)/i.test(bodyText);
+	}
+
+	// Generic fallback:
+	// If the body is HTML while the requested artifact is not HTML, it's not a leak.
+	// Otherwise, non-empty non-HTML body matches the generic non-HTML probe.
+	return !isHtml || isHtmlTarget;
+}
+
+/**
+ * Evaluates whether a request response represents a WAF block and derives
+ * a coarse verdict:
+ * - 'blocked': WAF stopped the request before reaching origin.
+ * - 'exposed': not blocked AND origin returned resource matching the probed artifact.
+ * - 'passed': not blocked, but origin did not serve resource (404, 5xx, empty 2xx, or SPA HTML shell).
+ */
+export function evaluateWAFVerdict(
+	status: number | string,
+	bodyText: string = '',
+	detection?: WAFDetectionResult,
+	headers?: Headers,
+	probedPayload?: string
+): { blocked: boolean; verdict: 'blocked' | 'passed' | 'exposed' } {
+	let isBlocked = false;
+
+	// Characteristic WAF block status codes
+	if (
+		status === 403 ||
+		status === '403' ||
+		status === 406 ||
+		status === '406' ||
+		status === 429 ||
+		status === '429' ||
+		status === 'BLOCKED'
+	) {
+		isBlocked = true;
+	}
+
+	// Response-level headers check
+	if (!isBlocked && headers) {
+		const cfMitigated = headers.get('cf-mitigated');
+		if (cfMitigated && (cfMitigated === 'challenge' || cfMitigated === 'block')) {
+			isBlocked = true;
+		}
+	}
+
+	// Response-level body markers check
+	if (!isBlocked && bodyText) {
+		// Captcha challenges in this response's body
+		if (
+			bodyText.includes('cf-turnstile') ||
+			/https?:\/\/challenges\.cloudflare\.com\/turnstile\//.test(bodyText) ||
+			/https?:\/\/(?:www\.)?google\.com\/recaptcha\//.test(bodyText) ||
+			bodyText.includes('g-recaptcha') ||
+			/https?:\/\/(?:www\.)?hcaptcha\.com\//.test(bodyText) ||
+			bodyText.includes('h-captcha')
+		) {
+			isBlocked = true;
+		} else if (
+			// Imperva / Incapsula block markers anchored to vendor context or fuller block page phrasing
+			((detection?.wafType === 'Imperva' ||
+				detection?.wafType === 'Incapsula' ||
+				/incapsula|imperva/i.test(bodyText)) &&
+				/incident id/i.test(bodyText)) ||
+			/request unsuccessful\. incapsula incident id/i.test(bodyText)
+		) {
+			isBlocked = true;
+		} else if (
+			// General WAF block markers
+			/waf-block|blocked by[^\n]{0,100}waf|request blocked|access denied[^\n]{0,100}firewall|security incident/i.test(bodyText) ||
+			/powered by[^\n]{0,100}imperva|protected with[^\n]{0,100}bunkerweb/i.test(bodyText)
+		) {
+			isBlocked = true;
+		}
+	}
+
+	// 2. Derive verdict
+	if (isBlocked) {
+		return { blocked: true, verdict: 'blocked' };
+	}
+
+	const numStatus = typeof status === 'number' ? status : parseInt(status, 10);
+	if (!isNaN(numStatus) && numStatus >= 200 && numStatus < 300) {
+		if (bodyText && bodyText.trim().length > 0 && isPlausibleArtifactContent(bodyText, probedPayload)) {
+			return { blocked: false, verdict: 'exposed' };
+		}
+		return { blocked: false, verdict: 'passed' };
+	}
+
+	return { blocked: false, verdict: 'passed' };
+}
+
+export async function handleApiCheckWithEnvelope(
 	url: string,
 	page: number,
 	methods: string[],
@@ -199,12 +499,28 @@ export async function handleApiCheckFiltered(
 	useEncodingVariations: boolean = false,
 	detectedWAF?: string,
 	httpManipulation?: HTTPManipulationOptions,
-	options?: { fetch?: typeof fetch; color?: boolean; quiet?: boolean; isWorker?: boolean },
-): Promise<any[]> {
+	options?: {
+		fetch?: typeof fetch;
+		color?: boolean;
+		quiet?: boolean;
+		isWorker?: boolean;
+		allowLocal?: boolean;
+		pageSize?: number;
+		/**
+		 * Legitimate-User-Agent bypass test. `true` uses the curated list of
+		 * trusted identities; an array supplies custom ones; falsy disables it.
+		 * Blocked (403) requests are replayed under each identity to detect a
+		 * User-Agent allow-list bypass.
+		 */
+		spoofUserAgents?: boolean | LegitUserAgent[];
+	},
+): Promise<CheckResultEnvelope> {
 	const METHODS = methods && methods.length ? methods : ['GET'];
-	const results: any[] = [];
+	const results: AuditResultItem[] = [];
+	// Legitimate-User-Agent bypass test: identities to replay blocked requests with.
+	const legitUserAgents = resolveLegitUserAgents(options?.spoofUserAgents);
 	let baseUrl: string;
-	const limit = 50;
+	const limit = options?.pageSize && options.pageSize > 0 ? options.pageSize : 50;
 	const start = page * limit;
 	const end = start + limit;
 	let offset = 0;
@@ -216,7 +532,6 @@ export async function handleApiCheckFiltered(
 	}
 
 	// Case sensitive test: Modify URL hostname if flag is set
-
 	if (caseSensitiveTest) {
 		try {
 			const u = new URL(url);
@@ -261,16 +576,25 @@ export async function handleApiCheckFiltered(
 		payloadSource = { ...payloadSource, ...ADVANCED_PAYLOADS };
 	}
 
-	// Generate encoded payload variations if requested
-	if (useEncodingVariations) {
-		const encodedPayloads = generateEncodedPayloads(payloadSource);
-		payloadSource = { ...payloadSource, ...encodedPayloads };
-	}
-
 	const payloadEntries =
 		(categories && categories.length
 			? Object.entries(payloadSource).filter(([cat]) => categories.includes(cat))
 			: Object.entries(payloadSource)) as [string, any][];
+
+	// Calculate total items matching category/method filters
+	let totalItems = 0;
+	for (const [_, info] of payloadEntries) {
+		const checkType = info.type || 'ParamCheck';
+		const payloads = falsePositiveTest ? info.falsePayloads || [] : info.payloads || [];
+		if (checkType === 'ParamCheck') {
+			totalItems += payloads.length * METHODS.length;
+		} else if (checkType === 'FileCheck') {
+			totalItems += payloads.length;
+		} else if (checkType === 'Header') {
+			totalItems += payloads.length * METHODS.length;
+		}
+	}
+
 	for (const [category, info] of payloadEntries) {
 		const checkType = info.type || 'ParamCheck';
 		const payloads = falsePositiveTest ? info.falsePayloads || [] : info.payloads || [];
@@ -281,7 +605,7 @@ export async function handleApiCheckFiltered(
 					payload = randomUppercase(payload); // Modify payload
 				}
 
-				// Generate payload variations — WAF-specific and encoding are additive
+				// Generate payload variations
 				let payloadVariations = [payload];
 
 				// Add WAF-specific bypass variations if WAF is detected
@@ -289,7 +613,7 @@ export async function handleApiCheckFiltered(
 				if (wafType) {
 					const wafSpecificPayloads = generateWAFSpecificPayloads(wafType, payload);
 					if (wafSpecificPayloads.length > 1) {
-						payloadVariations.push(...wafSpecificPayloads);
+						payloadVariations.push(...wafSpecificPayloads.slice(1));
 					}
 				}
 
@@ -302,17 +626,21 @@ export async function handleApiCheckFiltered(
 				// Deduplicate
 				payloadVariations = [...new Set(payloadVariations)];
 
-				// Test each payload variation
 				for (const currentPayload of payloadVariations) {
 					for (const method of METHODS) {
-						if (offset >= end) return results;
+						if (offset >= end) {
+							return { results, page, pageSize: limit, total: totalItems, hasMore: true };
+						}
 						if (offset >= start) {
-							// Process custom headers if provided
-							let headersObj = customHeaders ? processCustomHeaders(customHeaders, currentPayload) : undefined;
-
-							// Apply HTTP manipulation if enabled
+							// Check if detected WAF is CloudFront
+							const detectedWAFType = detectedWAF || (wafDetectionResult?.detected ? wafDetectionResult.wafType : undefined);
 							let finalPayload = currentPayload;
 							let finalMethod = method;
+
+							// Process custom headers if provided
+							const headersObj = customHeaders ? processCustomHeaders(customHeaders, currentPayload) : undefined;
+
+							// Apply HTTP manipulation if enabled
 							if (httpManipulation?.enableParameterPollution) {
 								const pollutedPayloads = generateHTTPManipulationPayloads(currentPayload, 'pollution');
 								if (pollutedPayloads.length > 1) {
@@ -323,8 +651,6 @@ export async function handleApiCheckFiltered(
 								const variations = HTTPManipulator.generatePaddingVariations('test', currentPayload, paddingSize);
 								finalPayload = variations.queryPadding;
 							}
-
-							const detectedWAFType = detectedWAF || (wafDetectionResult?.detected ? wafDetectionResult.wafType : undefined);
 
 							const res = await sendRequest(
 								url,
@@ -338,17 +664,51 @@ export async function handleApiCheckFiltered(
 								undefined,
 								options,
 							);
+
+							const bodyText = res?.bodyText || '';
+							const itemStatus = res ? res.status : 'ERR';
+							const itemError = res?.error || null;
+							const { blocked, verdict } = evaluateWAFVerdict(itemStatus, bodyText, wafDetectionResult, res?.response?.headers, currentPayload);
+
+							// If the WAF blocked this (403), replay it under trusted User-Agents
+							// to see whether a legitimate identity bypasses the block.
+							let userAgentBypass: UserAgentBypassInfo | undefined;
+							if (legitUserAgents.length && (itemStatus === 403 || itemStatus === '403')) {
+								userAgentBypass = await probeUserAgentBypass(
+									(ua) =>
+										sendRequest(
+											url,
+											finalMethod,
+											finalPayload,
+											{ ...(headersObj || {}), 'User-Agent': ua },
+											payloadTemplate,
+											followRedirect,
+											useEnhancedPayloads,
+											detectedWAFType,
+											undefined,
+											options,
+										),
+									legitUserAgents,
+									wafDetectionResult,
+									currentPayload,
+								);
+							}
+
 							results.push({
 								category,
 								payload: currentPayload,
 								originalPayload: payload, // Keep track of original
 								method,
-								status: res ? res.status : 'ERR',
+								status: itemStatus,
 								is_redirect: res ? res.is_redirect : false,
 								responseTime: res ? res.responseTime : 0,
 								wafDetected: wafDetectionResult?.detected || false,
 								wafType: detectedWAFType || 'Unknown',
 								bypassTechnique: currentPayload !== payload ? 'Advanced' : 'Standard',
+								blocked,
+								verdict,
+								error: itemError,
+								userAgentBypass,
 							});
 						}
 						offset++;
@@ -361,7 +721,9 @@ export async function handleApiCheckFiltered(
 				if (caseSensitiveTest) {
 					payload = randomUppercase(payload); // Modify payload
 				}
-				if (offset >= end) return results;
+				if (offset >= end) {
+					return { results, page, pageSize: limit, total: totalItems, hasMore: true };
+				}
 				if (offset >= start) {
 					// Use potentially modified baseUrl for the base, and modified payload for the file path
 					const fileUrl = baseUrl.replace(/\/$/, '') + '/' + payload.replace(/^\//, '');
@@ -379,15 +741,47 @@ export async function handleApiCheckFiltered(
 						undefined,
 						options,
 					);
+
+					const bodyText = res?.bodyText || '';
+					const itemStatus = res ? res.status : 'ERR';
+					const itemError = res?.error || null;
+					const { blocked, verdict } = evaluateWAFVerdict(itemStatus, bodyText, wafDetectionResult, res?.response?.headers, payload);
+
+					let userAgentBypass: UserAgentBypassInfo | undefined;
+					if (legitUserAgents.length && (itemStatus === 403 || itemStatus === '403')) {
+						userAgentBypass = await probeUserAgentBypass(
+							(ua) =>
+								sendRequest(
+									fileUrl,
+									'GET',
+									undefined,
+									{ ...(headersObj || {}), 'User-Agent': ua },
+									undefined,
+									followRedirect,
+									useEnhancedPayloads,
+									detectedWAF || (wafDetectionResult?.detected ? wafDetectionResult.wafType : undefined),
+									undefined,
+									options,
+								),
+							legitUserAgents,
+							wafDetectionResult,
+							payload,
+						);
+					}
+
 					results.push({
 						category,
 						payload,
 						method: 'GET',
-						status: res ? res.status : 'ERR',
+						status: itemStatus,
 						is_redirect: res ? res.is_redirect : false,
 						responseTime: res ? res.responseTime : 0,
 						wafDetected: wafDetectionResult?.detected || false,
 						wafType: detectedWAF || (wafDetectionResult?.detected ? wafDetectionResult.wafType : 'Unknown'),
+						blocked,
+						verdict,
+						error: itemError,
+						userAgentBypass,
 					});
 				}
 				offset++;
@@ -418,7 +812,9 @@ export async function handleApiCheckFiltered(
 				}
 
 				for (const method of METHODS) {
-					if (offset >= end) return results;
+					if (offset >= end) {
+						return { results, page, pageSize: limit, total: totalItems, hasMore: true };
+					}
 					if (offset >= start) {
 						const res = await sendRequest(
 							url,
@@ -432,15 +828,49 @@ export async function handleApiCheckFiltered(
 							undefined,
 							options,
 						);
+
+						const bodyText = res?.bodyText || '';
+						const itemStatus = res ? res.status : 'ERR';
+						const itemError = res?.error || null;
+						const { blocked, verdict } = evaluateWAFVerdict(itemStatus, bodyText, wafDetectionResult, res?.response?.headers, payload);
+
+						// Skip the User-Agent category: its payload IS the UA header, so
+						// swapping in a trusted UA would be a meaningless "bypass".
+						let userAgentBypass: UserAgentBypassInfo | undefined;
+						if (legitUserAgents.length && category !== 'User-Agent' && (itemStatus === 403 || itemStatus === '403')) {
+							userAgentBypass = await probeUserAgentBypass(
+								(ua) =>
+									sendRequest(
+										url,
+										method,
+										undefined,
+										{ ...headersObj, 'User-Agent': ua },
+										payloadTemplate,
+										followRedirect,
+										useEnhancedPayloads,
+										detectedWAF || (wafDetectionResult?.detected ? wafDetectionResult.wafType : undefined),
+										undefined,
+										options,
+									),
+							legitUserAgents,
+							wafDetectionResult,
+							payload,
+						);
+						}
+
 						results.push({
 							category,
 							payload,
 							method,
-							status: res ? res.status : 'ERR',
+							status: itemStatus,
 							is_redirect: res ? res.is_redirect : false,
 							responseTime: res ? res.responseTime : 0,
 							wafDetected: wafDetectionResult?.detected || false,
 							wafType: detectedWAF || (wafDetectionResult?.detected ? wafDetectionResult.wafType : 'Unknown'),
+							blocked,
+							verdict,
+							error: itemError,
+							userAgentBypass,
 						});
 					}
 					offset++;
@@ -448,5 +878,58 @@ export async function handleApiCheckFiltered(
 			}
 		}
 	}
-	return results;
+	return { results, page, pageSize: limit, total: totalItems, hasMore: end < totalItems };
+}
+
+export async function handleApiCheckFiltered(
+	url: string,
+	page: number,
+	methods: string[],
+	categories?: string[],
+	payloadTemplate?: string,
+	followRedirect: boolean = false,
+	customHeaders?: string,
+	falsePositiveTest: boolean = false,
+	caseSensitiveTest: boolean = false,
+	useEnhancedPayloads: boolean = false,
+	useAdvancedPayloads: boolean = false,
+	autoDetectWAF: boolean = false,
+	useEncodingVariations: boolean = false,
+	detectedWAF?: string,
+	httpManipulation?: HTTPManipulationOptions,
+	options?: {
+		fetch?: typeof fetch;
+		color?: boolean;
+		quiet?: boolean;
+		isWorker?: boolean;
+		allowLocal?: boolean;
+		pageSize?: number;
+		/**
+		 * Legitimate-User-Agent bypass test. `true` uses the curated list of
+		 * trusted identities; an array supplies custom ones; falsy disables it.
+		 * Blocked (403) requests are replayed under each identity to detect a
+		 * User-Agent allow-list bypass.
+		 */
+		spoofUserAgents?: boolean | LegitUserAgent[];
+	},
+): Promise<AuditResultItem[]> {
+	const envelope = await handleApiCheckWithEnvelope(
+		url,
+		page,
+		methods,
+		categories,
+		payloadTemplate,
+		followRedirect,
+		customHeaders,
+		falsePositiveTest,
+		caseSensitiveTest,
+		useEnhancedPayloads,
+		useAdvancedPayloads,
+		autoDetectWAF,
+		useEncodingVariations,
+		detectedWAF,
+		httpManipulation,
+		options,
+	);
+	return envelope.results;
 }

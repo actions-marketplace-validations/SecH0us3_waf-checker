@@ -1,10 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { generateSARIFReport } from '@waf-checker/core';
+import { generateSARIFReport, generateJUnitReport } from '@waf-checker/core';
 import { generateCheckHtml, generateBatchHtml } from './reports/html';
 import { generateMarkdownReport, generateBatchMarkdown } from './reports/markdown';
 
-export type ReportFormat = 'json' | 'csv' | 'html' | 'sarif' | 'markdown' | 'md';
+export type ReportFormat = 'json' | 'csv' | 'html' | 'sarif' | 'markdown' | 'md' | 'junit';
 
 export interface CheckResult {
 	status: number | string;
@@ -18,6 +18,7 @@ export interface CheckResult {
 	wafType?: string;
 	bypassTechnique?: string;
 	originalPayload?: string;
+	verdict?: 'blocked' | 'passed' | 'exposed';
 }
 
 export interface BatchResult {
@@ -36,6 +37,7 @@ export interface BatchResult {
 export function deduceFormat(outputPath: string): ReportFormat {
 	const ext = path.extname(outputPath).toLowerCase();
 	if (ext === '.sarif') return 'sarif';
+	if (ext === '.junit' || ext === '.xml') return 'junit';
 	if (ext === '.md' || ext === '.markdown') return 'markdown';
 	if (ext === '.json') return 'json';
 	if (ext === '.csv') return 'csv';
@@ -47,7 +49,10 @@ export function deduceFormat(outputPath: string): ReportFormat {
  * Generate a CSV report for CheckResults.
  */
 function generateCheckCsv(results: CheckResult[]): string {
-	const headers = ['Category', 'Method', 'Status', 'Response Time (ms)', 'Is Redirect', 'Payload', 'Error'];
+	const headers = [
+		'Category', 'Method', 'Status', 'Response Time (ms)', 'Is Redirect',
+		'WAF Type', 'Bypass Technique', 'Verdict', 'Payload', 'Original Payload', 'Error',
+	];
 	const escape = (val: any) => {
 		const str = String(val ?? '');
 		if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
@@ -64,7 +69,11 @@ function generateCheckCsv(results: CheckResult[]): string {
 			escape(r.status),
 			escape(r.responseTime),
 			escape(r.is_redirect ? 'Yes' : 'No'),
+			escape(r.wafType),
+			escape(r.bypassTechnique),
+			escape(r.verdict),
 			escape(r.payload),
+			escape(r.originalPayload),
 			escape(r.error)
 		].join(','))
 	];
@@ -101,6 +110,8 @@ function generateBatchCsv(results: BatchResult[]): string {
 	return lines.join('\n');
 }
 
+import { ReverseEngineeringReport, VirtualPatchReport } from '@waf-checker/core';
+
 /**
  * Write check or batch report to file.
  */
@@ -109,20 +120,31 @@ export function writeReport(
 	format: ReportFormat,
 	type: 'check' | 'batch',
 	urlOrFile: string,
-	results: any[]
+	results: any[],
+	reverseEngineering?: ReverseEngineeringReport,
+	virtualPatches?: VirtualPatchReport
 ): void {
 	let outputContent = '';
 
 	if (format === 'json') {
-		outputContent = JSON.stringify(results, null, 2);
+		if (type === 'check') {
+			outputContent = JSON.stringify({ results, reverseEngineering, virtualPatches }, null, 2);
+		} else {
+			outputContent = JSON.stringify(results, null, 2);
+		}
 	} else if (format === 'sarif') {
 		if (type === 'batch') {
 			throw new Error('SARIF report format is only supported for single target audits (check command), not batch audits.');
 		}
-		outputContent = generateSARIFReport(results, urlOrFile);
+		outputContent = generateSARIFReport(results, urlOrFile, reverseEngineering);
+	} else if (format === 'junit') {
+		if (type === 'batch') {
+			throw new Error('JUnit report format is only supported for single target audits (check command), not batch audits.');
+		}
+		outputContent = generateJUnitReport(results, urlOrFile);
 	} else if (format === 'markdown' || format === 'md') {
 		if (type === 'check') {
-			outputContent = generateMarkdownReport(results as CheckResult[], urlOrFile);
+			outputContent = generateMarkdownReport(results as CheckResult[], urlOrFile, reverseEngineering, virtualPatches);
 		} else {
 			outputContent = generateBatchMarkdown(results as BatchResult[]);
 		}
@@ -132,7 +154,7 @@ export function writeReport(
 			: generateBatchCsv(results as BatchResult[]);
 	} else {
 		outputContent = type === 'check'
-			? generateCheckHtml(urlOrFile, results as CheckResult[])
+			? generateCheckHtml(urlOrFile, results as CheckResult[], reverseEngineering)
 			: generateBatchHtml(results as BatchResult[]);
 	}
 

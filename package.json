@@ -5,14 +5,18 @@
     "packages/*"
   ],
   "devDependencies": {
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.28.2",
     "fast-check": "^4.9.0",
     "typescript": "^7.0.2",
-    "vitest": "~4.1.10",
-    "wrangler": "^4.119.0"
+    "vitest": "~4.1.11",
+    "wrangler": "^4.130.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
   },
   "scripts": {
     "test": "npm run test --workspaces --if-present",
+    "test:e2e": "bash scripts/e2e-test-wafs.sh",
     "build": "npm run build --workspace=@waf-checker/core && npm run build --workspace=@waf-checker/cli",
     "dev:worker": "npm run dev --workspace=packages/worker"
   }

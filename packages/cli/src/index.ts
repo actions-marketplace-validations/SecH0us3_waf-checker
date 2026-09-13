@@ -8,7 +8,14 @@ import {
 	handleApiCheckFiltered,
 	isValidTargetUrl,
 	redactUrl,
-	PAYLOADS
+	PAYLOADS,
+	runReverseEngineeringAudit,
+	ReverseEngineeringReport,
+	generateVirtualPatches,
+	VirtualPatchReport,
+	PatchVendor,
+	PatchTier,
+	PatchAction,
 } from '@waf-checker/core';
 import { writeReport, deduceFormat, ReportFormat } from './report';
 
@@ -45,8 +52,8 @@ const program = new Command();
 
 program
 	.name('waf-checker')
-	.description('WAF Security Testing Tool (CLI version)')
-	.version('1.1.0')
+	.description('Automated WAF (Web Application Firewall) Security Auditing & Fingerprinting Tool')
+	.version('1.2.0')
 	.showHelpAfterError()
 	.option('--no-color', 'Disable colored output')
 	.addHelpText('after', detailedHelp);
@@ -164,21 +171,32 @@ checkCmd
 	.option('--encoding-variations', 'Use encoding and obfuscation variations', false)
 	.option('--http-manipulation', 'Run HTTP manipulation tests (Verb Tampering, Parameter Pollution, etc.)', false)
 	.option('--padding <size>', 'Enable WAF inspection buffer padding evasion (e.g. 8kb, 16kb, 64kb, 128kb)')
+	.option('--no-spoof-user-agent', 'Disable the legitimate User-Agent bypass test (replays blocked 403 requests as Googlebot, Slackbot, etc.)')
 	.option('--json', 'Output results in JSON format')
-	.option('-f, --format <format>', 'Output format for report: json, csv, html, sarif, markdown')
+	.option('-f, --format <format>', 'Output format for report: json, csv, html, sarif, markdown, junit')
 	.option('-o, --output <path>', 'File path to save the report to')
 	.option('--sarif-output <path>', 'File path to save SARIF report to')
 	.option('--markdown-output <path>', 'File path to save Markdown report to')
 	.option('--html-output <path>', 'File path to save HTML report to')
 	.option('--threshold <percent>', 'Minimum protection score percentage required to pass (e.g. 95). Exits with code 1 if score is lower')
+	.option('--reverse', 'Run deep WAF Reverse Engineering and OWASP Core Rule Set (CRS) audit', false)
+	.option('--reverse-engineer', 'Alias for --reverse', false)
+	.option('--patch [vendor]', 'Generate ready-to-deploy virtual patches (cloudflare, aws, modsecurity, coraza, nginx, gcp, azure, haproxy, caddy, apache, envoy, k8s, all)')
+	.option('--patch-output <path>', 'File path or directory to save generated virtual patch(es) to')
+	.option('--patch-tier <tier>', 'Defense tier: strict (exact token), heuristic (regex pattern), or both', 'both')
+	.option('--patch-action <action>', 'Rule action: block or simulate', 'block')
+	.option('--patch-scope', 'Scope virtual patches to the target URL path', false)
+	.option('--patch-include-misses', 'Include 404 Not Found and 5xx origin responses in virtual patch generation', false)
 	.option('-q, --quiet', 'Suppress per-request logging, displaying only final results')
 	.option('--silent', 'Alias for --quiet')
 	.option('--fail-on-bypass', 'Exit with exit code 1 if any bypasses are detected', false)
+	.option('--allow-local', 'Allow testing localhost, 127.0.0.1, and private IP ranges (Docker/LAN)', false)
 	.addHelpText('after', detailedHelp)
 	.action(async (url: string, options: any) => {
 		const isQuiet = options.quiet || options.silent;
+		const allowLocal = Boolean(options.allowLocal);
 		try {
-			if (!isValidTargetUrl(url)) {
+			if (!isValidTargetUrl(url, { allowLocal })) {
 				console.error(colors.red(`Error: Invalid target URL "${url}" or restricted IP.`));
 				process.exit(1);
 			}
@@ -214,11 +232,53 @@ checkCmd
 				options.encodingVariations,
 				options.detectedWaf,
 				httpManipulationOpts,
-				{ fetch: customFetch, color: useColor, quiet: isQuiet }
+				{ fetch: customFetch, color: useColor, quiet: isQuiet, allowLocal, spoofUserAgents: options.spoofUserAgent !== false }
 			);
 
+			let reverseReport: ReverseEngineeringReport | undefined = undefined;
+			if (options.reverse || options.reverseEngineer) {
+				if (!isQuiet) console.log(colors.cyan('\n[+] Executing deep WAF Reverse Engineering and OWASP CRS audit...'));
+				reverseReport = await runReverseEngineeringAudit(url, { fetch: customFetch, quiet: isQuiet, color: useColor, allowLocal });
+			}
+
+			let patchReport: VirtualPatchReport | undefined = undefined;
+			if (options.patch || options.patchOutput) {
+				const vendorChoice = typeof options.patch === 'string' ? (options.patch as PatchVendor) : 'all';
+				patchReport = generateVirtualPatches(results, {
+					vendor: vendorChoice,
+					tier: options.patchTier as PatchTier,
+					action: options.patchAction as PatchAction,
+					scopeToPath: Boolean(options.patchScope),
+					includeMisses: Boolean(options.patchIncludeMisses),
+					targetUrl: url,
+				});
+
+				if (options.patchOutput && patchReport.patches.length > 0) {
+					const outPath = path.resolve(options.patchOutput);
+					if (outPath.endsWith('.tf') || outPath.endsWith('.conf') || outPath.endsWith('.json') || outPath.endsWith('.txt') || outPath.endsWith('.caddyfile') || outPath.endsWith('.cfg') || outPath.endsWith('.yaml')) {
+						const dir = path.dirname(outPath);
+						if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+						const bundledContent = Object.values(patchReport.bundles)
+							.map((b) => b.terraform || b.native)
+							.filter(Boolean)
+							.join('\n\n');
+						fs.writeFileSync(outPath, bundledContent, 'utf8');
+					} else {
+						if (!fs.existsSync(outPath)) fs.mkdirSync(outPath, { recursive: true });
+						for (const [v, b] of Object.entries(patchReport.bundles)) {
+							if (b.ruleCount === 0) continue;
+							fs.writeFileSync(path.join(outPath, `${v}-patches.conf`), b.native, 'utf8');
+							if (b.terraform) {
+								fs.writeFileSync(path.join(outPath, `${v}-patches.tf`), b.terraform, 'utf8');
+							}
+						}
+					}
+					if (!isQuiet) console.log(colors.green(`Virtual patches saved to ${options.patchOutput}`));
+				}
+			}
+
 			if (options.json) {
-				console.log(JSON.stringify(results, null, 2));
+				console.log(JSON.stringify({ results, reverseEngineering: reverseReport, virtualPatches: patchReport }, null, 2));
 				return;
 			}
 
@@ -229,6 +289,11 @@ checkCmd
 			const bypassed = results.filter((r: any) => r.status === 200 || r.status === '200');
 			const redirect = results.filter((r: any) => r.is_redirect);
 			const errors = results.filter((r: any) => r.status === 'ERR');
+			// Legitimate User-Agent bypasses: blocked (403) with a normal UA, but let
+			// through once the request claimed to be a trusted bot. Tracked separately
+			// from `bypassed` (their status is 403) so protectionScore stays honest,
+			// but they still fail CI checks below.
+			const uaBypasses = results.filter((r: any) => r.userAgentBypass?.bypassed);
 
 			const protectionScore = results.length ? Math.round((blocked.length / results.length) * 100) : 100;
 
@@ -254,15 +319,53 @@ checkCmd
 					console.log(`... and ${colors.yellow(String(bypassed.length - 50))} more bypasses.`);
 				}
 				console.log('--------------------------------------------------------------------------------');
-			} else {
+			} else if (uaBypasses.length === 0) {
 				console.log(`\n${colors.green('🛡️ Perfect Score: All attack vectors were successfully blocked.')}`);
+			}
+
+			// Legitimate User-Agent bypasses: requests blocked with a normal UA that
+			// sailed through once the request claimed to be Googlebot, Slackbot, etc.
+			if (uaBypasses.length > 0) {
+				console.log(`\n${colors.red('🕵️ USER-AGENT ALLOW-LIST BYPASSES DETECTED:')}`);
+				console.log(colors.yellow('   (blocked with a normal User-Agent, but let through as a trusted bot)'));
+				console.log('--------------------------------------------------------------------------------');
+				uaBypasses.slice(0, 50).forEach((r: any) => {
+					const identities = r.userAgentBypass.hits.map((h: any) => h.name).join(', ');
+					const cat = colors.cyan(r.category);
+					const pay = colors.bold(String(r.payload).substring(0, 50));
+					console.log(`  • ${cat} [${r.method}] ${colors.green('403')} ${colors.red('→ bypassed')} as ${colors.red(identities)}`);
+					console.log(`      payload: ${pay}`);
+				});
+				if (uaBypasses.length > 50) {
+					console.log(`  ... and ${colors.yellow(String(uaBypasses.length - 50))} more User-Agent bypasses.`);
+				}
+				console.log('--------------------------------------------------------------------------------');
+			}
+
+			if (reverseReport) {
+				console.log(`\n=== 🕵️ WAF Reverse Engineering & CRS Matrix for ${colors.cyan(url)} ===`);
+				console.log(`  🛡️ CRS Active Rules:  ${colors.green(`${reverseReport.crsSummary.active} / ${reverseReport.crsSummary.total} (${reverseReport.crsSummary.activePercent}%)`)}`);
+				console.log(`  📦 Body Limit Window: ${colors.cyan(reverseReport.bodyLimit.limitFormatted)}`);
+				console.log(`  ⚖️ Scoring Paradigm:  ${colors.yellow(reverseReport.anomalyScore.mode === 'anomaly_scoring' ? `Collaborative Anomaly Scoring (Threshold: ${reverseReport.anomalyScore.detectedThreshold ?? '?'})` : reverseReport.anomalyScore.mode === 'traditional_regex' ? 'Traditional Strict Regex' : 'Unknown')}`);
+				console.log(`  ⏱️ Rate Limiting:     ${reverseReport.rateLimit.detected ? colors.red(`Triggered at ${reverseReport.rateLimit.thresholdRps} req/s`) : colors.green(`Safe up to ${reverseReport.rateLimit.safeTestedMaxRps} req/s (No 429)`)}`);
+			}
+
+			if (patchReport && patchReport.patches.length > 0) {
+				console.log(`\n=== 🛡️ WAF Virtual Patches Generated (${patchReport.patches.length} rules) ===`);
+				for (const [v, b] of Object.entries(patchReport.bundles)) {
+					if (b.ruleCount === 0) continue;
+					console.log(`  • ${colors.bold(v.toUpperCase().padEnd(12))}: ${colors.green(`${b.ruleCount} rule(s) ready`)}`);
+				}
+				if (options.patchOutput) {
+					console.log(`  📁 Saved to: ${colors.cyan(options.patchOutput)}`);
+				}
 			}
 			console.log();
 
 			if (options.output) {
 				const format = (options.format || deduceFormat(options.output)) as ReportFormat;
 				try {
-					writeReport(options.output, format, 'check', url, results);
+					writeReport(options.output, format, 'check', url, results, reverseReport, patchReport);
 					console.log(colors.green(`Report saved to ${options.output} (${format.toUpperCase()})`));
 				} catch (err: any) {
 					console.error(colors.red(`Error writing report: ${err.message}`));
@@ -271,7 +374,7 @@ checkCmd
 
 			if (options.sarifOutput) {
 				try {
-					writeReport(options.sarifOutput, 'sarif', 'check', url, results);
+					writeReport(options.sarifOutput, 'sarif', 'check', url, results, reverseReport, patchReport);
 					console.log(colors.green(`SARIF report saved to ${options.sarifOutput}`));
 				} catch (err: any) {
 					console.error(colors.red(`Error writing SARIF report: ${err.message}`));
@@ -280,7 +383,7 @@ checkCmd
 
 			if (options.markdownOutput) {
 				try {
-					writeReport(options.markdownOutput, 'markdown', 'check', url, results);
+					writeReport(options.markdownOutput, 'markdown', 'check', url, results, reverseReport, patchReport);
 					console.log(colors.green(`Markdown report saved to ${options.markdownOutput}`));
 				} catch (err: any) {
 					console.error(colors.red(`Error writing Markdown report: ${err.message}`));
@@ -289,7 +392,7 @@ checkCmd
 
 			if (options.htmlOutput) {
 				try {
-					writeReport(options.htmlOutput, 'html', 'check', url, results);
+					writeReport(options.htmlOutput, 'html', 'check', url, results, reverseReport, patchReport);
 					console.log(colors.green(`HTML report saved to ${options.htmlOutput}`));
 				} catch (err: any) {
 					console.error(colors.red(`Error writing HTML report: ${err.message}`));
@@ -302,10 +405,18 @@ checkCmd
 					console.error(colors.red(`CI/CD Threshold Failed: Protection score ${protectionScore}% is below required threshold of ${minThreshold}%.`));
 					process.exit(1);
 				}
+				// A User-Agent allow-list bypass defeats the WAF regardless of score.
+				if (uaBypasses.length > 0) {
+					console.error(colors.red(`CI/CD Threshold Failed: ${uaBypasses.length} User-Agent allow-list bypass(es) detected.`));
+					process.exit(1);
+				}
 			}
 
-			if (options.failOnBypass && bypassed.length > 0) {
-				console.error(colors.red(`CI/CD Check Failed: ${bypassed.length} bypasses detected.`));
+			if (options.failOnBypass && (bypassed.length > 0 || uaBypasses.length > 0)) {
+				const parts = [];
+				if (bypassed.length > 0) parts.push(`${bypassed.length} bypass(es)`);
+				if (uaBypasses.length > 0) parts.push(`${uaBypasses.length} User-Agent allow-list bypass(es)`);
+				console.error(colors.red(`CI/CD Check Failed: ${parts.join(' and ')} detected.`));
 				process.exit(1);
 			}
 		} catch (err: any) {
@@ -517,6 +628,164 @@ batchCmd
 		} catch (err: any) {
 			console.error(`Error: Batch audit failed: ${err.message}`);
 			process.exit(1);
+		}
+	});
+
+// Command: patch
+program
+	.command('patch <file>')
+	.description('Generate ready-to-deploy virtual patches from a saved JSON audit report')
+	.option('-w, --waf <vendor>', 'Target WAF vendor (cloudflare, aws, modsecurity, coraza, nginx, gcp, azure, haproxy, caddy, apache, envoy, k8s, all)', 'all')
+	.option('-t, --tier <tier>', 'Defense tier: strict, heuristic, or both', 'both')
+	.option('-a, --action <action>', 'Rule action: block or simulate', 'block')
+	.option('-o, --output <path>', 'Output file or directory to write patches to')
+	.option('--scope-to-path', 'Scope rules to target URL path if present in report', false)
+	.option('--include-misses', 'Include 404 Not Found and 5xx origin responses in virtual patch generation', false)
+	.option('--json', 'Output patch report in JSON format', false)
+	.action(async (file: string, options: any) => {
+		try {
+			const filePath = path.resolve(file);
+			if (!fs.existsSync(filePath)) {
+				console.error(colors.red(`Error: File "${file}" does not exist.`));
+				process.exit(1);
+			}
+
+			const content = fs.readFileSync(filePath, 'utf8');
+			const parsed = JSON.parse(content);
+			const results: any[] = Array.isArray(parsed) ? parsed : parsed.results || [];
+			const targetUrl = parsed.targetUrl || parsed.url;
+
+			const patchReport = generateVirtualPatches(results, {
+				vendor: options.waf as PatchVendor,
+				tier: options.tier as PatchTier,
+				action: options.action as PatchAction,
+				scopeToPath: Boolean(options.scopeToPath),
+				includeMisses: Boolean(options.includeMisses),
+				targetUrl,
+			});
+
+			if (options.json) {
+				console.log(JSON.stringify(patchReport, null, 2));
+				return;
+			}
+
+			console.log(`\n=== 🛡️ WAF-Checker Virtual Patch Generator ===`);
+			console.log(`Loaded ${results.length} audit test results from: ${colors.cyan(file)}`);
+			console.log(`Detected Bypasses to Remediate: ${patchReport.totalBypasses > 0 ? colors.red(String(patchReport.totalBypasses)) : colors.green('0')}`);
+
+			if (patchReport.totalBypasses === 0) {
+				console.log(colors.green('No bypasses detected in this audit report. No patches required!'));
+				return;
+			}
+
+			console.log(`\nGenerated Rules Summary:`);
+			for (const [v, b] of Object.entries(patchReport.bundles)) {
+				if (b.ruleCount === 0) continue;
+				console.log(`  • ${colors.bold(v.toUpperCase().padEnd(12))}: ${colors.green(`${b.ruleCount} rule(s)`)}`);
+			}
+
+			if (options.output) {
+				const outPath = path.resolve(options.output);
+				if (outPath.endsWith('.tf') || outPath.endsWith('.conf') || outPath.endsWith('.json') || outPath.endsWith('.yaml') || outPath.endsWith('.cfg') || outPath.endsWith('.txt')) {
+					const dir = path.dirname(outPath);
+					if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+					const bundledText = Object.values(patchReport.bundles)
+						.map((b) => b.terraform || b.native)
+						.filter(Boolean)
+						.join('\n\n');
+					fs.writeFileSync(outPath, bundledText, 'utf8');
+				} else {
+					if (!fs.existsSync(outPath)) fs.mkdirSync(outPath, { recursive: true });
+					const extMap: Record<string, string> = {
+						cloudflare: 'conf',
+						aws: 'json',
+						modsecurity: 'conf',
+						nginx: 'conf',
+						gcp: 'cel',
+						azure: 'json',
+						haproxy: 'cfg',
+						caddy: 'caddyfile',
+						apache: 'htaccess',
+						envoy: 'yaml',
+						k8s: 'yaml',
+					};
+					for (const [v, b] of Object.entries(patchReport.bundles)) {
+						if (b.ruleCount === 0) continue;
+						const ext = extMap[v] || 'conf';
+						fs.writeFileSync(path.join(outPath, `${v}-patches.${ext}`), b.native, 'utf8');
+						if (b.gcloud) {
+							fs.writeFileSync(path.join(outPath, `${v}-gcloud.sh`), b.gcloud, 'utf8');
+						}
+						if (b.azureCli) {
+							fs.writeFileSync(path.join(outPath, `${v}-azure-cli.sh`), b.azureCli, 'utf8');
+						}
+						if (b.terraform) {
+							fs.writeFileSync(path.join(outPath, `${v}-patches.tf`), b.terraform, 'utf8');
+						}
+					}
+				}
+				console.log(colors.green(`\n[✓] Patches successfully written to: ${options.output}`));
+			} else {
+				console.log(`\nPreview:`);
+				for (const [v, b] of Object.entries(patchReport.bundles)) {
+					if (b.ruleCount === 0) continue;
+					console.log(`\n--- ${v.toUpperCase()} ---`);
+					console.log(b.native);
+					if (b.gcloud) {
+						console.log(`\n--- ${v.toUpperCase()} (gcloud CLI) ---`);
+						console.log(b.gcloud);
+					}
+					if (b.azureCli) {
+						console.log(`\n--- ${v.toUpperCase()} (Azure CLI) ---`);
+						console.log(b.azureCli);
+					}
+					if (b.terraform) {
+						console.log(`\n--- ${v.toUpperCase()} (Terraform) ---`);
+						console.log(b.terraform);
+					}
+				}
+			}
+		} catch (err: any) {
+			console.error(colors.red(`Error generating patches: ${err.message}`));
+			process.exit(1);
+		}
+	});
+
+// Command: list-wafs — enumerate detectable WAF vendors (for automation/discovery)
+program
+	.command('list-wafs')
+	.description('List all WAF vendors this tool can fingerprint')
+	.option('--json', 'Output as a JSON array', false)
+	.action((options: any) => {
+		const wafs = WAFDetector.getSupportedWafs();
+		if (options.json) {
+			console.log(JSON.stringify(wafs, null, 2));
+			return;
+		}
+		console.log(colors.bold(`Supported WAF vendors (${wafs.length}):`));
+		for (const w of wafs) {
+			console.log(`  - ${w}`);
+		}
+	});
+
+// Command: list-categories — enumerate attack payload categories and their injection type
+program
+	.command('list-categories')
+	.description('List all attack payload categories and their injection type')
+	.option('--json', 'Output as a JSON array of {name, type} objects', false)
+	.action((options: any) => {
+		const categories = Object.entries(PAYLOADS).map(([name, cat]: [string, any]) => ({
+			name,
+			type: cat.type,
+			payloads: Array.isArray(cat.payloads) ? cat.payloads.length : 0,
+		}));
+		if (options.json) {
+			console.log(JSON.stringify(categories, null, 2));
+			return;
+		}
+		console.log(colors.bold(`Supported payload categories (${categories.length}):`));
+		for (const c of categories) {
+			console.log(`  - ${c.name} ${colors.dim(`[${c.type}, ${c.payloads} payloads]`)}`);
 		}
 	});
 

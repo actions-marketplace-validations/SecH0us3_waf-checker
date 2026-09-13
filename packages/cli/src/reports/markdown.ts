@@ -1,8 +1,15 @@
 import { CheckResult, BatchResult } from '../report';
+import { ReverseEngineeringReport, VirtualPatchReport } from '@waf-checker/core';
 
-export function generateMarkdownReport(results: CheckResult[], targetUrl?: string): string {
+export function generateMarkdownReport(
+	results: CheckResult[],
+	targetUrl?: string,
+	reverseEngineering?: ReverseEngineeringReport,
+	virtualPatches?: VirtualPatchReport
+): string {
 	let blocked = 0;
 	let bypassed = 0;
+	let misses = 0;
 	let errors = 0;
 	let other = 0;
 	let detectedWAF = 'Unknown';
@@ -15,6 +22,8 @@ export function generateMarkdownReport(results: CheckResult[], targetUrl?: strin
 			blocked++;
 		} else if (r.status === 200 || r.status === '200') {
 			bypassed++;
+		} else if (r.status === 404 || r.status === '404') {
+			misses++;
 		} else if (r.status === 'ERR' || r.status === 500 || r.status === '500') {
 			errors++;
 		} else {
@@ -26,15 +35,17 @@ export function generateMarkdownReport(results: CheckResult[], targetUrl?: strin
 	const protectionScore = total > 0 ? Math.round((blocked / total) * 100) : 100;
 
 	// Calculate per-category stats
-	const categoryMap = new Map<string, { total: number; blocked: number; bypassed: number; errors: number }>();
+	const categoryMap = new Map<string, { total: number; blocked: number; bypassed: number; misses: number; errors: number }>();
 
 	for (const r of results) {
-		const entry = categoryMap.get(r.category) || { total: 0, blocked: 0, bypassed: 0, errors: 0 };
+		const entry = categoryMap.get(r.category) || { total: 0, blocked: 0, bypassed: 0, misses: 0, errors: 0 };
 		entry.total++;
 		if (r.status === 403 || r.status === '403' || r.status === 'BLOCKED') {
 			entry.blocked++;
 		} else if (r.status === 200 || r.status === '200') {
 			entry.bypassed++;
+		} else if (r.status === 404 || r.status === '404') {
+			entry.misses++;
 		} else {
 			entry.errors++;
 		}
@@ -42,6 +53,7 @@ export function generateMarkdownReport(results: CheckResult[], targetUrl?: strin
 	}
 
 	const bypassedItems = results.filter((r) => r.status === 200 || r.status === '200');
+	const missedItems = results.filter((r) => r.status === 404 || r.status === '404');
 
 	// Status badge
 	const scoreEmoji = protectionScore >= 90 ? '🟢' : protectionScore >= 70 ? '🟡' : '🔴';
@@ -67,25 +79,26 @@ export function generateMarkdownReport(results: CheckResult[], targetUrl?: strin
 		`| :--- | :--- | :--- |`,
 		`| 🎯 **Total Tests** | \`${total}\` | \`100%\` |`,
 		`| 🛡️ **Blocked (Protected)** | \`${blocked}\` | \`${total > 0 ? Math.round((blocked / total) * 100) : 0}%\` |`,
-		`| ⚠️ **Bypassed (Vulnerable)** | \`${bypassed}\` | \`${total > 0 ? Math.round((bypassed / total) * 100) : 0}%\` |`,
+		`| 🔴 **Critical Bypasses (200 OK)** | \`${bypassed}\` | \`${total > 0 ? Math.round((bypassed / total) * 100) : 0}%\` |`,
+		`| ⚠️ **WAF Misses (Unprotected 404)** | \`${misses}\` | \`${total > 0 ? Math.round((misses / total) * 100) : 0}%\` |`,
 		`| ❓ **Errors / Other** | \`${errors + other}\` | \`${total > 0 ? Math.round(((errors + other) / total) * 100) : 0}%\` |`,
 		``,
 		`### 📊 Attack Category Breakdown`,
 		``,
-		`| Attack Category | Total | Blocked | Bypassed | Protection Rate |`,
-		`| :--- | :--- | :--- | :--- | :--- |`,
+		`| Attack Category | Total | Blocked | Bypasses (200) | Misses (404) | Protection Rate |`,
+		`| :--- | :--- | :--- | :--- | :--- | :--- |`,
 	];
 
 	for (const [cat, data] of categoryMap.entries()) {
 		const rate = data.total > 0 ? Math.round((data.blocked / data.total) * 100) : 100;
 		const catEmoji = rate >= 90 ? '🟢' : rate >= 70 ? '🟡' : '🔴';
-		lines.push(`| **${cat}** | \`${data.total}\` | \`${data.blocked}\` | \`${data.bypassed}\` | ${catEmoji} \`${rate}%\` |`);
+		lines.push(`| **${cat}** | \`${data.total}\` | \`${data.blocked}\` | \`${data.bypassed}\` | \`${data.misses}\` | ${catEmoji} \`${rate}%\` |`);
 	}
 
 	lines.push(``);
 
 	if (bypassedItems.length > 0) {
-		lines.push(`### ⚠️ Bypassed Payloads (${bypassedItems.length})`);
+		lines.push(`### 🔴 Critical Bypassed Payloads (200 OK) (${bypassedItems.length})`);
 		lines.push(``);
 		lines.push(`<details>`);
 		lines.push(`<summary><b>Click to inspect ${bypassedItems.length} bypassed attack vectors</b></summary>`);
@@ -111,7 +124,98 @@ export function generateMarkdownReport(results: CheckResult[], targetUrl?: strin
 		lines.push(`</details>`);
 	} else {
 		lines.push(`### ✅ No Bypasses Detected`);
-		lines.push(`All executed attack payloads were successfully blocked by the WAF.`);
+		lines.push(`No attack payloads yielded active 200 OK responses.`);
+	}
+
+	if (missedItems.length > 0) {
+		lines.push(``);
+		lines.push(`### ⚠️ WAF Misses / Origin Responses (404 Not Found) (${missedItems.length})`);
+		lines.push(``);
+		lines.push(`<details>`);
+		lines.push(`<summary><b>Click to inspect ${missedItems.length} unprotected vectors (Status 404)</b></summary>`);
+		lines.push(``);
+		lines.push(`> **Note:** These requests bypassed perimeter WAF inspection and reached the origin server (returning 404 Not Found). Consider adding virtual patches to block these attack patterns on the WAF level.`);
+		lines.push(``);
+		lines.push(`| Category | Method | Status | Time | Payload |`);
+		lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
+
+		for (const item of missedItems) {
+			const safePayload = item.payload
+				.replace(/&/g, '&amp;')
+				.replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;')
+				.replace(/"/g, '&quot;')
+				.replace(/'/g, '&#39;')
+				.replace(/\|/g, '&#124;')
+				.replace(/\r?\n/g, ' ');
+			lines.push(
+				`| \`${item.category}\` | \`${item.method}\` | \`${item.status}\` | \`${item.responseTime}ms\` | <code>${safePayload}</code> |`,
+			);
+		}
+
+		lines.push(``);
+		lines.push(`</details>`);
+	}
+
+	if (reverseEngineering) {
+		lines.push(``);
+		lines.push(`### 🕵️ WAF Reverse Engineering & OWASP Core Rule Set (CRS)`);
+		lines.push(``);
+		lines.push(`| Diagnostic Metric | Detection Result |`);
+		lines.push(`| :--- | :--- |`);
+		lines.push(`| 🛡️ **OWASP CRS Active Rules** | \`${reverseEngineering.crsSummary.active} / ${reverseEngineering.crsSummary.total} (${reverseEngineering.crsSummary.activePercent}% active)\` |`);
+		lines.push(`| 📦 **Inspection Body Limit** | \`${reverseEngineering.bodyLimit.limitFormatted}\` |`);
+		lines.push(`| ⚖️ **Scoring Mode** | \`${reverseEngineering.anomalyScore.mode === 'anomaly_scoring' ? `Collaborative Anomaly Scoring (Threshold: ${reverseEngineering.anomalyScore.detectedThreshold ?? 'Unknown'})` : reverseEngineering.anomalyScore.mode === 'traditional_regex' ? 'Traditional Strict Regex Blocking' : 'Unknown'}\` |`);
+		lines.push(`| ⏱️ **Rate Limit Protection** | \`${reverseEngineering.rateLimit.detected ? `Triggered at ${reverseEngineering.rateLimit.thresholdRps} req/s` : `Safe up to ${reverseEngineering.rateLimit.safeTestedMaxRps} req/s (No 429)`}\` |`);
+		lines.push(``);
+
+		if (reverseEngineering.crsRules.length > 0) {
+			lines.push(`<details>`);
+			lines.push(`<summary><b>Click to inspect OWASP CRS Rules Matrix (${reverseEngineering.crsRules.length} rules)</b></summary>`);
+			lines.push(``);
+			lines.push(`| Rule ID | Rule Name | Category | Paranoia Level | Status |`);
+			lines.push(`| :--- | :--- | :--- | :---: | :--- |`);
+			for (const r of reverseEngineering.crsRules) {
+				const statusEmoji = r.status === 'active' ? '🟢 Active' : r.status === 'disabled' ? '🔴 Disabled' : r.status === 'bypassed' ? '⚠️ Bypassed' : '❓ Unknown';
+				lines.push(`| \`${r.ruleId}\` | ${r.name} | \`${r.category}\` | \`PL${r.paranoiaLevel}\` | ${statusEmoji} |`);
+			}
+			lines.push(``);
+			lines.push(`</details>`);
+		}
+	}
+
+	// Virtual Patches (Auto-Mitigation) Section
+	if (virtualPatches && virtualPatches.totalBypasses > 0) {
+		lines.push(``);
+		lines.push(`### 🛡️ Recommended Virtual Patches (Auto-Mitigation)`);
+		lines.push(``);
+		lines.push(`> Generated **${virtualPatches.patches.length} virtual patch rules** across supported WAF engines to remediate **${virtualPatches.totalBypasses} detected bypasses**.`);
+		lines.push(``);
+		lines.push(`<details>`);
+		lines.push(`<summary><b>Click to inspect ready-to-deploy configuration snippets & Terraform HCL</b></summary>`);
+		lines.push(``);
+
+		for (const [vendor, bundle] of Object.entries(virtualPatches.bundles)) {
+			if (bundle.ruleCount === 0) continue;
+			const vendorTitle = vendor === 'cloudflare' ? 'Cloudflare Ruleset Engine' : vendor === 'aws' ? 'AWS WAF v2' : vendor === 'modsecurity' ? 'ModSecurity (CRS-style)' : 'NGINX';
+			lines.push(`#### ${vendorTitle}`);
+			lines.push(``);
+			lines.push('```' + (vendor === 'aws' ? 'json' : vendor === 'cloudflare' ? 'text' : 'apache'));
+			lines.push(bundle.native);
+			lines.push('```');
+			lines.push(``);
+
+			if (bundle.terraform) {
+				lines.push(`*Terraform (HCL):*`);
+				lines.push(``);
+				lines.push('```hcl');
+				lines.push(bundle.terraform);
+				lines.push('```');
+				lines.push(``);
+			}
+		}
+
+		lines.push(`</details>`);
 	}
 
 	lines.push(``);

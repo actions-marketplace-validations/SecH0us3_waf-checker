@@ -15,6 +15,8 @@ describe('WAFDetector', () => {
 		expect(wafs).toContain('LiteSpeed');
 		expect(wafs).toContain('PT Application Firewall');
 		expect(wafs).toContain('Signal Sciences');
+		expect(wafs).toContain('BunkerWeb');
+		expect(wafs).toContain('OWASP Coraza');
 		expect(wafs).not.toContain('Generic WAF'); // Generic should be filtered out
 	});
 
@@ -176,6 +178,38 @@ describe('WAFDetector', () => {
 		const result = await WAFDetector.detectFromResponse(mockResponse);
 		expect(result.detected).toBe(true);
 		expect(result.wafType).toBe('PT Application Firewall');
+	});
+
+	it('should detect BunkerWeb from server header and body patterns', async () => {
+		const mockResponse = {
+			status: 403,
+			headers: {
+				get: (name: string) => {
+					if (name.toLowerCase() === 'server') return 'BunkerWeb';
+					return null;
+				},
+			},
+		} as unknown as Response;
+
+		const result = await WAFDetector.detectFromResponse(mockResponse, 'This website is protected with BunkerWeb');
+		expect(result.detected).toBe(true);
+		expect(result.wafType).toBe('BunkerWeb');
+	});
+
+	it('should detect OWASP Coraza from headers and body pattern', async () => {
+		const mockResponse = {
+			status: 403,
+			headers: {
+				get: (name: string) => {
+					if (name.toLowerCase() === 'x-coraza-waf') return '1';
+					return null;
+				},
+			},
+		} as unknown as Response;
+
+		const result = await WAFDetector.detectFromResponse(mockResponse, 'blocked by OWASP Coraza');
+		expect(result.detected).toBe(true);
+		expect(result.wafType).toBe('OWASP Coraza');
 	});
 
 	it('should detect Imperva from new cookies and incident ID body', async () => {
@@ -363,5 +397,90 @@ describe('WAFDetector', () => {
 
 	it('should throw an error during bypass detection for invalid URLs', async () => {
 		await expect(WAFDetector.detectBypassOpportunities('http://169.254.169.254')).rejects.toThrow('Invalid URL or restricted IP');
+	});
+
+	describe('newly added vendor signatures', () => {
+		// Build a Response whose header getter returns the provided map (case-insensitive).
+		const mockResponse = (headers: Record<string, string>, status = 403): Response =>
+			({
+				status,
+				headers: {
+					get: (name: string) => headers[name.toLowerCase()] ?? null,
+				},
+			}) as unknown as Response;
+
+		it('lists the new vendors as supported', () => {
+			const wafs = WAFDetector.getSupportedWafs();
+			for (const name of [
+				'SafeDog', 'Jiasule', 'Yunjiasu', 'NSFOCUS', 'Comodo cWatch', 'Nemesida',
+				'Tencent Cloud WAF', 'Anquanbao', 'Yunsuo',
+			]) {
+				expect(wafs).toContain(name);
+			}
+		});
+
+		it('detects Tencent Cloud WAF from server header and body', async () => {
+			const res = mockResponse({ server: 'tencent' });
+			const result = await WAFDetector.detectFromResponse(res, 'Blocked by Tencent Cloud WAF: waf.tencent-cloud.com');
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Tencent Cloud WAF');
+		});
+
+		it('detects Anquanbao from its X-Powered-By header', async () => {
+			const res = mockResponse({ 'x-powered-by-anquanbao': 'Miejd' });
+			const result = await WAFDetector.detectFromResponse(res, 'aqb_cc/error page from Anquanbao');
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Anquanbao');
+		});
+
+		it('detects Yunsuo from its session cookie and body', async () => {
+			const res = mockResponse({ 'set-cookie': 'yunsuo_session=abc; Path=/' });
+			const result = await WAFDetector.detectFromResponse(res, 'blocked by _yunsuo_ protection');
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Yunsuo');
+		});
+
+		it('detects SafeDog from X-Powered-By header and cookie', async () => {
+			const res = mockResponse({ 'x-powered-by': 'WAF/2.0', 'set-cookie': 'safedog-flow-item=abc; Path=/' });
+			const result = await WAFDetector.detectFromResponse(res);
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('SafeDog');
+			expect(result.suggestedBypassTechniques.length).toBeGreaterThan(0);
+		});
+
+		it('detects Jiasule from server header and cookie', async () => {
+			const res = mockResponse({ server: 'jiasule-waf', 'set-cookie': '__jsluid=deadbeef; Path=/' });
+			const result = await WAFDetector.detectFromResponse(res);
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Jiasule');
+		});
+
+		it('detects Yunjiasu from server header and 403 status', async () => {
+			const res = mockResponse({ server: 'yunjiasu-nginx' });
+			const result = await WAFDetector.detectFromResponse(res);
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Yunjiasu');
+		});
+
+		it('detects NSFOCUS from server header and body', async () => {
+			const res = mockResponse({ server: 'NSFocus' });
+			const result = await WAFDetector.detectFromResponse(res, 'Blocked by NSFOCUS WAF');
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('NSFOCUS');
+		});
+
+		it('detects Comodo cWatch from server header', async () => {
+			const res = mockResponse({ server: 'Protected by COMODO WAF' });
+			const result = await WAFDetector.detectFromResponse(res, 'Comodo WAF blocked this request');
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Comodo cWatch');
+		});
+
+		it('detects Nemesida from server header and body', async () => {
+			const res = mockResponse({ server: 'nemesida' });
+			const result = await WAFDetector.detectFromResponse(res, 'Nemesida WAF: Suspicious activity detected');
+			expect(result.detected).toBe(true);
+			expect(result.wafType).toBe('Nemesida');
+		});
 	});
 });

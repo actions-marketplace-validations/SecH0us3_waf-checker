@@ -7,3 +7,6 @@ export * from './check';
 export * from './utils/security';
 export * from './utils/payload-utils';
 export * from './reports';
+export * from './reverse-engineering';
+export * from './virtual-patch';
+export * from './payloads-data/legit-user-agents';

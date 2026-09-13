@@ -1,0 +1,799 @@
+import { describe, it, expect } from 'vitest';
+import {
+	generateVirtualPatches,
+	filterBypasses,
+	sanitizeStrictToken,
+	escapeRegex,
+	escapeDoubleQuotes,
+	detectInspectionLocation,
+	CATEGORY_HEURISTICS,
+} from '../src/virtual-patch';
+import { AuditResultItem } from '../src/reports/types';
+
+describe('Virtual Patching & Rule Generator', () => {
+	const mockBypasses: AuditResultItem[] = [
+		{
+			category: 'SQL Injection',
+			payload: "' UNION SELECT 1, @@version-- -",
+			method: 'GET',
+			status: 200,
+			responseTime: 45,
+		},
+		{
+			category: 'SQL Injection',
+			payload: "' OR '1'='1",
+			method: 'GET',
+			status: '200',
+			responseTime: 30,
+		},
+		{
+			category: 'XSS',
+			payload: '<script>alert(1)</script>',
+			method: 'GET',
+			status: 200,
+			responseTime: 50,
+		},
+		{
+			category: 'Command Injection',
+			payload: '; cat /etc/passwd',
+			method: 'POST',
+			status: 200,
+			responseTime: 60,
+		},
+	];
+
+	const mockBlocked: AuditResultItem[] = [
+		{
+			category: 'SQL Injection',
+			payload: "' UNION SELECT null",
+			method: 'GET',
+			status: 403,
+			responseTime: 20,
+		},
+		{
+			category: 'XSS',
+			payload: '<svg/onload=alert(1)>',
+			method: 'GET',
+			status: 'BLOCKED',
+			responseTime: 25,
+		},
+	];
+
+	describe('filterBypasses', () => {
+		it('should only return items with status 200 or "200"', () => {
+			const mixed = [...mockBypasses, ...mockBlocked];
+			const filtered = filterBypasses(mixed);
+			expect(filtered.length).toBe(4);
+			expect(filtered.every((i) => i.status === 200 || i.status === '200')).toBe(true);
+		});
+
+		it('should return empty array if no bypasses exist', () => {
+			expect(filterBypasses(mockBlocked)).toEqual([]);
+		});
+	});
+
+	describe('Heuristics & Token Sanitization', () => {
+		it('should escape regex special characters correctly', () => {
+			expect(escapeRegex('test.com?id=1&name=a')).toBe('test\\.com\\?id=1&name=a');
+			expect(escapeRegex('127.0.0.1')).toBe('127\\.0\\.0\\.1');
+		});
+
+		it('should escape double quotes and backslashes correctly for config embedding', () => {
+			expect(escapeDoubleQuotes('plain-text')).toBe('plain-text');
+			expect(escapeDoubleQuotes('"quoted"')).toBe('\\"quoted\\"');
+			expect(escapeDoubleQuotes('path\\with\\slash')).toBe('path\\\\with\\\\slash');
+			expect(escapeDoubleQuotes('mixed\\"quote')).toBe('mixed\\\\\\"quote');
+		});
+
+		it('should sanitize strict tokens properly and consolidate sensitive extensions', () => {
+			expect(sanitizeStrictToken("  ' OR '1'='1 \n")).toBe("' OR '1'='1");
+			expect(sanitizeStrictToken('/dump.sql', 'Sensitive Files')).toBe('.sql');
+			expect(sanitizeStrictToken('database.sql', 'Sensitive Files')).toBe('.sql');
+			expect(sanitizeStrictToken('db.sql', 'Sensitive Files')).toBe('.sql');
+			expect(sanitizeStrictToken('backup.tar.gz', 'Sensitive Files')).toBe('.tar.gz');
+			expect(sanitizeStrictToken('backup.zip', 'Sensitive Files')).toBe('.zip');
+			expect(sanitizeStrictToken('server.key', 'Sensitive Files')).toBe('.key');
+			expect(sanitizeStrictToken('server.pem', 'Sensitive Files')).toBe('.pem');
+			expect(sanitizeStrictToken('.git/config', 'Sensitive Files')).toBe('.git');
+			expect(sanitizeStrictToken('.env', 'Sensitive Files')).toBe('.env');
+			expect(sanitizeStrictToken('wp-config.php', 'Sensitive Files')).toBe('wp-config.php');
+		});
+
+		it('should detect inspection location correctly', () => {
+			expect(detectInspectionLocation('User-Agent', 'GET', 'sqlmap')).toBe('header');
+			expect(detectInspectionLocation('Path Traversal', 'GET', '../../etc/passwd')).toBe('uri');
+			expect(detectInspectionLocation('SQL Injection', 'POST', "' or 1=1")).toBe('body');
+			expect(detectInspectionLocation('SQL Injection', 'GET', "' or 1=1")).toBe('query');
+		});
+
+		it('should have heuristic definitions for core categories', () => {
+			expect(CATEGORY_HEURISTICS['SQL Injection']).toBeDefined();
+			expect(CATEGORY_HEURISTICS['XSS']).toBeDefined();
+			expect(CATEGORY_HEURISTICS['Path Traversal']).toBeDefined();
+			expect(CATEGORY_HEURISTICS['SSRF']).toBeDefined();
+		});
+	});
+
+	describe('generateVirtualPatches (Orchestrator)', () => {
+		it('should return empty report when no bypasses are provided', () => {
+			const report = generateVirtualPatches(mockBlocked);
+			expect(report.totalBypasses).toBe(0);
+			expect(report.patches.length).toBe(0);
+			expect(report.bundles.cloudflare.ruleCount).toBe(0);
+		});
+
+		it('should generate patches for all vendors by default', () => {
+			const report = generateVirtualPatches(mockBypasses, { targetUrl: 'https://example.com/api/v1/search' });
+			expect(report.totalBypasses).toBe(4);
+			expect(report.patches.length).toBeGreaterThan(0);
+
+			expect(report.bundles.cloudflare).toBeDefined();
+			expect(report.bundles.aws).toBeDefined();
+			expect(report.bundles.modsecurity).toBeDefined();
+			expect(report.bundles.nginx).toBeDefined();
+			expect(report.bundles.gcp).toBeDefined();
+			expect(report.bundles.azure).toBeDefined();
+			expect(report.bundles.haproxy).toBeDefined();
+			expect(report.bundles.caddy).toBeDefined();
+			expect(report.bundles.k8s).toBeDefined();
+
+			expect(report.bundles.cloudflare.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.aws.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.modsecurity.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.nginx.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.gcp.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.azure.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.haproxy.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.caddy.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.k8s.ruleCount).toBeGreaterThan(0);
+		});
+
+		it('should filter by specific vendor when requested', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'cloudflare' });
+			expect(report.patches.every((p) => p.vendor === 'cloudflare')).toBe(true);
+			expect(report.bundles.cloudflare).toBeDefined();
+			expect(report.bundles.aws).toBeUndefined();
+		});
+
+		it('should support strict tier only', () => {
+			const report = generateVirtualPatches(mockBypasses, { tier: 'strict', vendor: 'cloudflare' });
+			expect(report.patches.every((p) => p.tier === 'strict')).toBe(true);
+		});
+
+		it('should support heuristic tier only', () => {
+			const report = generateVirtualPatches(mockBypasses, { tier: 'heuristic', vendor: 'cloudflare' });
+			expect(report.patches.every((p) => p.tier === 'heuristic')).toBe(true);
+		});
+	});
+
+	describe('Cloudflare Ruleset Generator', () => {
+		it('should generate valid Wirefilter expressions and Terraform HCL', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'cloudflare' });
+			const strictSqli = report.patches.find((p) => p.category === 'SQL Injection' && p.tier === 'strict');
+			expect(strictSqli).toBeDefined();
+			expect(strictSqli?.nativeRule).toContain('lower(http.request.uri.query) contains');
+			expect(strictSqli?.terraformHcl).toContain('resource "cloudflare_ruleset"');
+			expect(strictSqli?.terraformHcl).toContain('phase       = "http_request_firewall_custom"');
+			expect(strictSqli?.terraformHcl).toContain('action      = "block"');
+		});
+
+		it('should apply scopeToPath when enabled', () => {
+			const report = generateVirtualPatches(mockBypasses, {
+				vendor: 'cloudflare',
+				scopeToPath: true,
+				targetUrl: 'https://example.com/api/v1/search',
+			});
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('(http.request.uri.path eq "/api/v1/search") and');
+		});
+
+		it('should support simulation / log mode', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'cloudflare', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.terraformHcl).toContain('action      = "log"');
+		});
+	});
+
+	describe('AWS WAF v2 Generator', () => {
+		it('should generate valid AWS WAF JSON Statements and Terraform HCL', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'aws' });
+			const strictSqli = report.patches.find((p) => p.category === 'SQL Injection' && p.tier === 'strict');
+			expect(strictSqli).toBeDefined();
+
+			const parsedJson = JSON.parse(strictSqli!.nativeRule);
+			expect(parsedJson.Name).toBe('WafChecker_Patch_SQLInjection_Strict');
+			expect(parsedJson.Action).toEqual({ Block: {} });
+			expect(parsedJson.Statement.OrStatement.Statements.length).toBe(2);
+
+			expect(strictSqli?.terraformHcl).toContain('resource "aws_wafv2_rule_group"');
+			expect(strictSqli?.terraformHcl).toContain('byte_match_statement');
+		});
+
+		it('should support simulation / Count mode in AWS WAF', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'aws', action: 'simulate' });
+			const patch = report.patches[0];
+			const parsedJson = JSON.parse(patch.nativeRule);
+			expect(parsedJson.Action).toEqual({ Count: {} });
+			expect(patch.terraformHcl).toContain('count {}');
+		});
+	});
+
+	describe('ModSecurity Generator', () => {
+		it('should generate valid SecRule directives with unique IDs', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'modsecurity', ruleIdPrefix: 950000 });
+			const strictPatch = report.patches.find((p) => p.tier === 'strict');
+			expect(strictPatch).toBeDefined();
+			expect(strictPatch?.nativeRule).toContain('SecRule ARGS|REQUEST_URI "@contains');
+			expect(strictPatch?.nativeRule).toContain('id:950000');
+			expect(strictPatch?.nativeRule).toContain('deny,status:403');
+		});
+
+		it('should support simulation mode in ModSecurity', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'modsecurity', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('pass,log,auditlog');
+			expect(patch.nativeRule).toContain('[SIMULATION]');
+		});
+
+		it('should generate chained rules when scopeToPath is enabled', () => {
+			const report = generateVirtualPatches(mockBypasses, {
+				vendor: 'modsecurity',
+				scopeToPath: true,
+				targetUrl: 'https://example.com/api/login',
+			});
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('SecRule REQUEST_URI "@beginsWith /api/login"');
+			expect(patch.nativeRule).toContain('chain');
+		});
+	});
+
+	describe('NGINX Generator', () => {
+		it('should generate valid nginx configuration blocks and map snippets', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'nginx' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('if ($query_string ~*');
+			expect(patch.nativeRule).toContain('return 403;');
+			expect(patch.nativeRule).toContain('High-Performance Alternative');
+			expect(patch.nativeRule).toContain('map $query_string');
+		});
+
+		it('should support simulation mode in NGINX', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'nginx', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('add_header X-WAF-Simulation-Triggered "1"');
+		});
+
+		it('should wrap in location block when scopeToPath is enabled', () => {
+			const report = generateVirtualPatches(mockBypasses, {
+				vendor: 'nginx',
+				scopeToPath: true,
+				targetUrl: 'https://example.com/v1/auth',
+			});
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('location /v1/auth {');
+		});
+
+		it('should escape double quotes in NGINX payloads and regexes', () => {
+			const bypassWithQuotes: AuditResultItem[] = [
+				{
+					category: 'SQL Injection',
+					method: 'GET',
+					payload: 'admin" OR "1"="1',
+					status: 200,
+					responseTime: 45,
+				},
+			];
+			const report = generateVirtualPatches(bypassWithQuotes, { vendor: 'nginx', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('\\"1\\"');
+			expect(patch.nativeRule).not.toMatch(/~[*] ".*[^\\]".*"/);
+		});
+	});
+
+	describe('Engine Safety & Escaping', () => {
+		it('should escape HCL interpolation syntax for SSTI in Terraform', () => {
+			const sstiBypasses: AuditResultItem[] = [
+				{
+					category: 'SSTI',
+					method: 'GET',
+					payload: '${7*7}',
+					status: 200,
+					responseTime: 30,
+				},
+			];
+			const report = generateVirtualPatches(sstiBypasses, { vendor: 'aws', tier: 'heuristic' });
+			const patch = report.patches[0];
+			expect(patch.terraformHcl).toContain('$${');
+			expect(patch.terraformHcl).not.toContain('"${.*?}"');
+		});
+
+		it('should generate or_statement in AWS Terraform for multiple strict tokens', () => {
+			const multiBypasses: AuditResultItem[] = [
+				{ category: 'XSS', method: 'GET', payload: '<script>1</script>', status: 200, responseTime: 20 },
+				{ category: 'XSS', method: 'GET', payload: '<script>2</script>', status: 200, responseTime: 22 },
+			];
+			const report = generateVirtualPatches(multiBypasses, { vendor: 'aws', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.terraformHcl).toContain('or_statement');
+			expect(patch.terraformHcl).toContain('<script>1</script>');
+			expect(patch.terraformHcl).toContain('<script>2</script>');
+		});
+
+		it('should generate single_header in AWS Terraform for header bypasses', () => {
+			const headerBypasses: AuditResultItem[] = [
+				{ category: 'User-Agent', method: 'GET', payload: 'sqlmap/1.0', status: 200, responseTime: 20 },
+			];
+			const report = generateVirtualPatches(headerBypasses, { vendor: 'aws', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.terraformHcl).toContain('single_header');
+			expect(patch.terraformHcl).toContain('name = "user-agent"');
+		});
+
+		it('should start ModSecurity rule IDs at 1000000 by default to avoid CRS conflicts', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'modsecurity' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('id:1000000');
+		});
+	});
+
+	describe('WAF Misses & 404 Remediation', () => {
+		const mixedResults: AuditResultItem[] = [
+			{ category: 'SQL Injection', method: 'GET', payload: "' OR 1=1--", status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 404, responseTime: 25 },
+			{ category: 'Path Traversal', method: 'GET', payload: '/../../etc/passwd', status: 404, responseTime: 28 },
+			{ category: 'XXE', method: 'POST', payload: '<!ENTITY xxe ...>', status: 500, responseTime: 40 },
+			{ category: 'XSS', method: 'GET', payload: '<script>alert(1)</script>', status: 403, responseTime: 15 },
+		];
+
+		it('filterBypasses should return only 200 OK by default', () => {
+			const filtered = filterBypasses(mixedResults);
+			expect(filtered.length).toBe(1);
+			expect(filtered[0].status).toBe(200);
+		});
+
+		it('filterBypasses should return 200, 404, and 500 when includeMisses is true', () => {
+			const filtered = filterBypasses(mixedResults, { includeMisses: true });
+			expect(filtered.length).toBe(4);
+			const statuses = filtered.map((f) => f.status);
+			expect(statuses).toContain(200);
+			expect(statuses).toContain(404);
+			expect(statuses).toContain(500);
+			expect(statuses).not.toContain(403);
+		});
+
+		it('filterBypasses should filter by explicit statusCodes', () => {
+			const filtered = filterBypasses(mixedResults, { statusCodes: [404] });
+			expect(filtered.length).toBe(2);
+			expect(filtered.every((f) => f.status === 404)).toBe(true);
+		});
+
+		it('generateVirtualPatches should generate perimeter rules for /.git/config when includeMisses is true', () => {
+			const report = generateVirtualPatches(mixedResults, {
+				vendor: 'cloudflare',
+				includeMisses: true,
+			});
+			expect(report.totalBypasses).toBe(4);
+			const gitPatch = report.patches.find((p) => p.category === 'Sensitive Files');
+			expect(gitPatch).toBeDefined();
+			expect(gitPatch?.nativeRule).toContain('.git');
+		});
+	});
+
+	describe('Cloudflare Wirefilter & Extension Consolidation', () => {
+		it('should consolidate dump.sql and db.sql into a single .sql match in Cloudflare rules', () => {
+			const sqlFiles: AuditResultItem[] = [
+				{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+				{ category: 'Sensitive Files', method: 'GET', payload: '/db.sql', status: 200, responseTime: 20 },
+				{ category: 'Sensitive Files', method: 'GET', payload: '/database.sql', status: 200, responseTime: 20 },
+			];
+
+			const report = generateVirtualPatches(sqlFiles, { vendor: 'cloudflare', tier: 'strict' });
+			const cfBundle = report.bundles.cloudflare;
+			expect(cfBundle.native).toContain('contains ".sql"');
+			expect(cfBundle.native).not.toContain('contains "dump.sql"');
+			expect(cfBundle.native).not.toContain('contains "db.sql"');
+		});
+
+		it('should join multiple Cloudflare rules with boolean "or" in native bundle for valid Wirefilter syntax', () => {
+			const mixed: AuditResultItem[] = [
+				{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			];
+
+			const report = generateVirtualPatches(mixed, { vendor: 'cloudflare', tier: 'both' });
+			const cfBundle = report.bundles.cloudflare;
+			expect(cfBundle.ruleCount).toBe(2);
+			expect(cfBundle.native).toContain(' or\n\n');
+			expect(cfBundle.native).toMatch(/\)\s+or\s+\(/);
+		});
+	});
+
+	describe('Idiomatic Rules (NGINX, ModSecurity, AWS WAF)', () => {
+		const sensitiveFiles: AuditResultItem[] = [
+			{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/backup.zip', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/wp-config.php', status: 200, responseTime: 20 },
+		];
+
+		it('NGINX should generate native location blocks for Sensitive Files instead of if', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'nginx', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('location ~* \\.');
+			expect(patch.nativeRule).toContain('location ~ /\\.(?:git)');
+			expect(patch.nativeRule).toContain('location ~* /(wp-config\\.php)');
+			expect(patch.nativeRule).toContain('return 403;');
+		});
+
+		it('ModSecurity should generate a single @pm rule for multi-token sensitive file checks', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'modsecurity', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('@pm');
+			expect(patch.nativeRule).toContain('.sql');
+			expect(patch.nativeRule).toContain('.zip');
+			expect(patch.nativeRule).toContain('.git');
+			expect(patch.nativeRule).toContain('wp-config.php');
+			expect(patch.nativeRule).not.toContain('@contains');
+		});
+
+		it('AWS WAF bundle should format multiple rules as a valid JSON array', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'aws' });
+			const awsBundle = report.bundles.aws;
+			expect(awsBundle.ruleCount).toBeGreaterThan(1);
+			expect(() => JSON.parse(awsBundle.native)).not.toThrow();
+			const parsed = JSON.parse(awsBundle.native);
+			expect(Array.isArray(parsed)).toBe(true);
+			expect(parsed[0].Name).toBeDefined();
+		});
+	});
+
+	describe('Google Cloud Armor Generator', () => {
+		const sensitiveFiles: AuditResultItem[] = [
+			{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/backup.zip', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/wp-config.php', status: 200, responseTime: 20 },
+		];
+
+		it('should generate valid CEL expressions for sensitive files and attack vectors', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'gcp', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.vendor).toBe('gcp');
+			expect(patch.nativeRule).toContain("request.path.lower().endsWith('.sql')");
+			expect(patch.nativeRule).toContain("request.path.lower().endsWith('.zip')");
+			expect(patch.nativeRule).toContain("request.path.matches('/\\\\.(?:git)')");
+			expect(patch.nativeRule).toContain("request.path.lower().endsWith('/wp-config.php')");
+			expect(patch.terraformHcl).toContain('google_compute_security_policy');
+			expect(patch.terraformHcl).toContain('action      = "deny(403)"');
+			expect(patch.gcloudCommand).toContain('gcloud compute security-policies rules create');
+		});
+
+		it('should support simulation mode (preview = true) in Cloud Armor', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'gcp', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.terraformHcl).toContain('preview     = true');
+			expect(patch.gcloudCommand).toContain('--preview');
+		});
+
+		it('should scope Cloud Armor rules to URL path when requested', () => {
+			const report = generateVirtualPatches(mockBypasses, {
+				vendor: 'gcp',
+				scopeToPath: true,
+				targetUrl: 'https://example.com/api/v1',
+			});
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain("request.path == '/api/v1' &&");
+		});
+
+		it('should join multiple CEL rules with || in bundle', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'gcp', tier: 'both' });
+			const gcpBundle = report.bundles.gcp;
+			expect(gcpBundle).toBeDefined();
+			expect(gcpBundle.ruleCount).toBeGreaterThan(1);
+			expect(gcpBundle.native).toContain(' ||\n\n');
+			expect(gcpBundle.terraform).toContain('google_compute_security_policy');
+			expect(gcpBundle.gcloud).toContain('gcloud compute security-policies');
+		});
+	});
+
+	describe('Azure WAF Generator', () => {
+		const sensitiveFiles: AuditResultItem[] = [
+			{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/backup.zip', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+		];
+
+		it('should generate valid Azure WAF custom rules, Terraform, and Azure CLI commands', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'azure', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.vendor).toBe('azure');
+			expect(patch.nativeRule).toContain('"operator": "EndsWith"');
+			expect(patch.nativeRule).toContain('.sql');
+			expect(patch.nativeRule).toContain('"operator": "RegEx"');
+			expect(patch.terraformHcl).toContain('custom_rules');
+			expect(patch.terraformHcl).toContain('operator           = "EndsWith"');
+			expect(patch.azureCliCommand).toContain('az network front-door waf-policy rule create');
+			expect(patch.azureCliCommand).toContain('--action="Block"');
+		});
+
+		it('should support simulation mode (action = Log) in Azure WAF', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'azure', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('"action": "Log"');
+			expect(patch.terraformHcl).toContain('action    = "Log"');
+			expect(patch.azureCliCommand).toContain('--action="Log"');
+		});
+	});
+
+	describe('HAProxy Generator', () => {
+		const sensitiveFiles: AuditResultItem[] = [
+			{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+		];
+
+		it('should generate valid HAProxy ACL directives', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'haproxy', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.vendor).toBe('haproxy');
+			expect(patch.nativeRule).toContain('acl is_sensitive_files_ext path_end -i -- .sql');
+			expect(patch.nativeRule).toContain('acl is_sensitive_files_vcs path_beg -i -- /.git');
+			expect(patch.nativeRule).toContain('http-request deny deny_status 403');
+		});
+
+		it('should support simulation mode in HAProxy', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'haproxy', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('http-request set-header X-WAF-Simulation "blocked"');
+		});
+	});
+
+	describe('Caddy Generator', () => {
+		const sensitiveFiles: AuditResultItem[] = [
+			{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+		];
+
+		it('should generate valid Caddyfile named matchers', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'caddy', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.vendor).toBe('caddy');
+			expect(patch.nativeRule).toContain('@waf_patch_sensitive_files_strict');
+			expect(patch.nativeRule).toContain('path *.sql');
+			expect(patch.nativeRule).toContain('path */.git/*');
+			expect(patch.nativeRule).toContain('respond @waf_patch_sensitive_files_strict 403');
+		});
+
+		it('should support simulation mode in Caddy', () => {
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'caddy', action: 'simulate' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('header @waf_patch_sensitive_files_strict X-WAF-Simulation "blocked"');
+		});
+	});
+
+	describe('Apache Generator', () => {
+		it('should generate valid mod_rewrite block rules for the query string', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'apache', tier: 'strict' });
+			const patch = report.patches.find((p) => p.category === 'SQL Injection');
+			expect(patch).toBeDefined();
+			expect(patch!.vendor).toBe('apache');
+			expect(patch!.nativeRule).toContain('RewriteCond %{QUERY_STRING}');
+			expect(patch!.nativeRule).toContain('[NC]');
+			expect(patch!.nativeRule).toContain('RewriteRule ^ - [F,L]');
+			expect(patch!.nativeRule).toContain('mod_rewrite');
+		});
+
+		it('should use REQUEST_URI for path-based categories', () => {
+			const sensitiveFiles: AuditResultItem[] = [
+				{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+			];
+			const report = generateVirtualPatches(sensitiveFiles, { vendor: 'apache', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('RewriteCond %{REQUEST_URI}');
+		});
+
+		it('should use HTTP_USER_AGENT for User-Agent category', () => {
+			const uaBypasses: AuditResultItem[] = [
+				{ category: 'User-Agent', method: 'GET', payload: 'sqlmap/1.0', status: 200, responseTime: 20 },
+			];
+			const report = generateVirtualPatches(uaBypasses, { vendor: 'apache', tier: 'strict' });
+			expect(report.patches[0].nativeRule).toContain('RewriteCond %{HTTP_USER_AGENT}');
+		});
+
+		it('should switch to environment-variable tagging in simulation mode', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'apache', action: 'simulate', tier: 'strict' });
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('[E=WAF_SIM_');
+			expect(patch.nativeRule).not.toContain('[F,L]');
+			expect(patch.nativeRule).toContain('mod_headers');
+		});
+
+		it('should scope to path with a REQUEST_URI prefix condition', () => {
+			const report = generateVirtualPatches(mockBypasses, {
+				vendor: 'apache',
+				tier: 'strict',
+				scopeToPath: true,
+				targetUrl: 'https://example.com/api/login',
+			});
+			const patch = report.patches[0];
+			expect(patch.nativeRule).toContain('RewriteCond %{REQUEST_URI} "^/api/login"');
+		});
+
+		it('should encode double quotes as \\x22 (not a literal/escaped quote) in CondPatterns', () => {
+			const quoted: AuditResultItem[] = [
+				{ category: 'SQL Injection', method: 'GET', payload: 'admin" OR "1"="1', status: 200, responseTime: 45 },
+			];
+			const report = generateVirtualPatches(quoted, { vendor: 'apache', tier: 'strict' });
+			const rule = report.patches[0].nativeRule;
+			// Apache does not honor \" inside a quoted CondPattern, so a literal quote
+			// would terminate the argument ("bad flag delimiters"). Must be \x22.
+			expect(rule).toContain('\\x22');
+			// The CondPattern itself must not contain a raw double-quote.
+			const cond = rule.split('\n').find((l) => l.startsWith('RewriteCond'))!;
+			expect(cond.slice(cond.indexOf('"') + 1, cond.lastIndexOf('"'))).not.toContain('"');
+		});
+
+		it('must NOT double backslashes in heuristic CondPatterns (Apache passes \\\\ to PCRE)', () => {
+			// Apache's tokenizer passes \\ straight to PCRE, so a doubled backslash
+			// turns \( into an unbalanced group and \s/\b into literal-backslash runs.
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'apache', tier: 'heuristic' });
+			const sqli = report.patches.find((p) => p.category === 'SQL Injection')!;
+			expect(sqli.nativeRule).toContain('\\b'); // single-backslash word boundary preserved
+			expect(sqli.nativeRule).not.toContain('\\\\'); // no doubled backslashes
+		});
+
+		it('should note the body-inspection limitation for body categories', () => {
+			const bodyBypass: AuditResultItem[] = [
+				{ category: 'XXE', method: 'POST', payload: '<!ENTITY xxe SYSTEM "file:///etc/passwd">', status: 200, responseTime: 40 },
+			];
+			const report = generateVirtualPatches(bodyBypass, { vendor: 'apache', tier: 'strict' });
+			expect(report.patches[0].nativeRule).toContain('cannot inspect request bodies');
+		});
+
+		it('should be included in the "all" vendor bundle', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'all' });
+			expect(report.bundles.apache).toBeDefined();
+			expect(report.bundles.apache.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.apache.native).toContain('RewriteRule');
+		});
+	});
+
+	describe('Envoy Generator', () => {
+		it('should generate a route with safe_regex match and direct_response 403', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'envoy', tier: 'strict' });
+			const patch = report.patches.find((p) => p.category === 'SQL Injection');
+			expect(patch).toBeDefined();
+			expect(patch!.vendor).toBe('envoy');
+			expect(patch!.nativeRule).toContain('- match:');
+			expect(patch!.nativeRule).toContain('safe_regex:');
+			expect(patch!.nativeRule).toContain('regex:');
+			expect(patch!.nativeRule).toContain('direct_response:');
+			expect(patch!.nativeRule).toContain('status: 403');
+			// case-insensitive, substring-matching RE2 wrapper
+			expect(patch!.nativeRule).toContain('(?i)');
+			// Must raise RE2's default program-size ceiling (100) or Envoy rejects
+			// any non-trivial alternation at config load.
+			expect(patch!.nativeRule).toContain('max_program_size');
+			// Query-borne payloads must match the :path HEADER (which carries the
+			// query string), not the route path matcher (which drops it).
+			expect(patch!.nativeRule).toContain('name: ":path"');
+			expect(patch!.nativeRule).toContain('string_match:');
+		});
+
+		it('should match a header for User-Agent bypasses', () => {
+			const uaBypasses: AuditResultItem[] = [
+				{ category: 'User-Agent', method: 'GET', payload: 'sqlmap/1.0', status: 200, responseTime: 20 },
+			];
+			const report = generateVirtualPatches(uaBypasses, { vendor: 'envoy', tier: 'strict' });
+			const rule = report.patches[0].nativeRule;
+			expect(rule).toContain('headers:');
+			expect(rule).toContain('name: "user-agent"');
+			expect(rule).toContain('string_match:');
+		});
+
+		it('should forward + tag instead of blocking in simulation mode', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'envoy', action: 'simulate', tier: 'strict' });
+			const rule = report.patches[0].nativeRule;
+			expect(rule).toContain('x-waf-simulation');
+			expect(rule).toContain('REPLACE_WITH_UPSTREAM_CLUSTER');
+			expect(rule).not.toContain('status: 403');
+		});
+
+		it('should anchor the regex to the path when scopeToPath is set', () => {
+			const report = generateVirtualPatches(mockBypasses, {
+				vendor: 'envoy',
+				tier: 'strict',
+				scopeToPath: true,
+				targetUrl: 'https://example.com/api/login',
+			});
+			expect(report.patches[0].nativeRule).toContain('(?i)^/api/login.*');
+		});
+
+		it('should note the body-inspection limitation for body categories', () => {
+			const bodyBypass: AuditResultItem[] = [
+				{ category: 'XXE', method: 'POST', payload: '<!ENTITY xxe SYSTEM "file:///etc/passwd">', status: 200, responseTime: 40 },
+			];
+			const report = generateVirtualPatches(bodyBypass, { vendor: 'envoy', tier: 'strict' });
+			expect(report.patches[0].nativeRule).toContain('cannot read request bodies');
+		});
+
+		it('should be included in the "all" vendor bundle', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'all' });
+			expect(report.bundles.envoy).toBeDefined();
+			expect(report.bundles.envoy.ruleCount).toBeGreaterThan(0);
+			expect(report.bundles.envoy.native).toContain('direct_response:');
+		});
+	});
+
+	describe('Kubernetes Ingress Generator', () => {
+		const sensitiveFiles: AuditResultItem[] = [
+			{ category: 'Sensitive Files', method: 'GET', payload: '/dump.sql', status: 200, responseTime: 20 },
+			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 200, responseTime: 20 },
+		];
+
+		it('should generate valid Kubernetes Ingress YAML manifests', () => {
+			const report = generateVirtualPatches(sensitiveFiles, {
+				vendor: 'k8s',
+				tier: 'strict',
+				targetUrl: 'https://security.example.com',
+			});
+			const patch = report.patches[0];
+			expect(patch.vendor).toBe('k8s');
+			expect(patch.nativeRule).toContain('kind: Ingress');
+			expect(patch.nativeRule).toContain('nginx.ingress.kubernetes.io/server-snippet:');
+			expect(patch.nativeRule).toContain('location ~* \\.(sql)$');
+			expect(patch.nativeRule).toContain('location ~ /\\.(?:git)');
+			expect(patch.nativeRule).toContain('host: security.example.com');
+		});
+
+		it('should join multiple K8s manifests with --- in bundle', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'k8s', tier: 'both' });
+			const k8sBundle = report.bundles.k8s;
+			expect(k8sBundle).toBeDefined();
+			expect(k8sBundle.ruleCount).toBeGreaterThan(1);
+			expect(k8sBundle.native).toContain('\n---\n');
+		});
+	});
+
+	describe('Coraza WAF Support', () => {
+		it('should generate SecRule directives when vendor is coraza', () => {
+			const report = generateVirtualPatches(mockBypasses, { vendor: 'coraza', tier: 'strict' });
+			expect(report.patches.length).toBeGreaterThan(0);
+			expect(report.bundles.coraza).toBeDefined();
+			expect(report.bundles.coraza.native).toContain('SecRule');
+		});
+	});
+
+	describe('String Escaping in Virtual Patch Generators', () => {
+		const bypassWithQuotesAndBackslashes: AuditResultItem[] = [
+			{
+				category: 'XSS',
+				payload: '<script>alert(\\"xss\\")</script>',
+				method: 'GET',
+				status: 200,
+				responseTime: 30,
+			},
+		];
+
+		it('should properly escape backslashes before quotes across all generators', () => {
+			const report = generateVirtualPatches(bypassWithQuotesAndBackslashes, {
+				targetUrl: 'https://example.com/search',
+				tier: 'both',
+			});
+
+			// ModSecurity
+			const modsecBundle = report.bundles.modsecurity.native;
+			expect(modsecBundle).toContain('\\\\\\"xss\\\\\\"');
+
+			// Caddy
+			const caddyBundle = report.bundles.caddy.native;
+			expect(caddyBundle).toContain('\\\\\\"xss\\\\\\"');
+
+			// GCP
+			const gcpPatch = report.patches.find((p) => p.vendor === 'gcp');
+			expect(gcpPatch?.gcloudCommand).toContain('\\\\\\"');
+
+			// Azure
+			const azurePatch = report.patches.find((p) => p.vendor === 'azure');
+			expect(azurePatch?.azureCliCommand).toContain('\\\\\\"');
+		});
+	});
+});

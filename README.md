@@ -2,22 +2,22 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/SecH0us3/waf-checker?color=blue&label=release)](https://github.com/SecH0us3/waf-checker/releases)
 [![GitHub Action](https://img.shields.io/badge/action-v1-blue?logo=githubactions&logoColor=white)](https://github.com/SecH0us3/waf-checker/releases)
-[![Coverage: Core](https://img.shields.io/badge/coverage%3A%20core-92.5%25-brightgreen)](packages/core)
-[![Coverage: CLI](https://img.shields.io/badge/coverage%3A%20cli-93.2%25-brightgreen)](packages/cli)
-[![Tests](https://img.shields.io/badge/tests-287%20passed-brightgreen)]()
+[![Coverage: Core](https://img.shields.io/badge/coverage%3A%20core-93.0%25-brightgreen)](packages/core)
+[![Coverage: CLI](https://img.shields.io/badge/coverage%3A%20cli-93.5%25-brightgreen)](packages/cli)
+[![Tests](https://img.shields.io/badge/tests-366%20passed-brightgreen)]()
 
 This project helps you check how well your Web Application Firewall (WAF) protects your product against common web attacks. It can be run as a Cloudflare Worker (with a built-in interactive Web UI) or as a standalone Node.js CLI tool.
 
 ## 🧪 Test Coverage & Status
 
-All packages are thoroughly tested with automated unit, integration, property-based (fast-check fuzzing), and network resilience suites (100% SSRF safety compliance, protocol evasion techniques, and report formatters):
+All packages are thoroughly tested with automated unit, integration, property-based (fast-check fuzzing), network resilience, and reverse engineering suites (100% SSRF safety compliance, protocol evasion techniques, and report formatters):
 
 | Package | Line Coverage | Statements | Functions | Test Suite |
 | :--- | :---: | :---: | :---: | :---: |
-| [**`@waf-checker/core`**](packages/core) | `92.5%` 🟢 | `92.1%` | `96.1%` | 🟢 210 passing |
-| [**`@waf-checker/cli`**](packages/cli) | `93.2%` 🟢 | `92.4%` | `96.7%` | 🟢 47 passing |
+| [**`@waf-checker/core`**](packages/core) | `93.0%` 🟢 | `92.6%` | `96.4%` | 🟢 282 passing |
+| [**`@waf-checker/cli`**](packages/cli) | `93.5%` 🟢 | `92.8%` | `96.7%` | 🟢 54 passing |
 | [**`@waf-checker/worker`**](packages/worker) | `Passing` 🟢 | — | — | 🟢 30 passing |
-| **Total Monorepo Suite** | **`92.8%`** | **`92.3%`** | **`96.4%`** | **🟢 287 tests passing** |
+| **Total Monorepo Suite** | **`93.2%`** | **`92.7%`** | **`96.6%`** | **🟢 366 tests passing** |
 
 ## Features
 
@@ -27,11 +27,36 @@ All packages are thoroughly tested with automated unit, integration, property-ba
 - Color-coded terminal and web results: 🟢 403/BLOCKED = blocked, 🔴 2xx/5xx = potential bypass, 🟠 3xx = redirect.
 - Results displayed in a filterable table with details for each payload.
 
-### Attack Categories (25 total)
-SQL Injection, XSS, Command Injection, Path Traversal, SSRF, Local File Inclusion, Sensitive Files, Open Redirect, SSTI, XXE, NoSQL Injection, GraphQL Injection, JWT Attack (Header), JWT Attack (Param), Prototype Pollution (JSON Body), Prototype Pollution (URL/Param), LDAP Injection, CRLF Injection, HTTP Parameter Pollution, User-Agent, IP Bypass, HTTP Request Smuggling, Web Cache Poisoning, UTF8/Unicode Bypass, WAF Inspection Limit Bypass (Padding).
+### 🕵️ WAF Reverse Engineering & CRS Matrix (`--reverse`)
+- **OWASP Core Rule Set (CRS v3/v4) Mapping**: Audits active vs disabled rule IDs (`920xxx`, `921xxx`, `930xxx`, `931xxx`, `932xxx`, `933xxx`, `934xxx`, `941xxx`, `942xxx`, `943xxx`, `944xxx`) with Paranoia Levels (PL1-PL4).
+- **Inspection Body Limit Detection**: Binary search probing (8KB – 128KB, precision ~1KB) to identify buffer truncation boundaries.
+- **Anomaly Scoring Mode Detection**: Probes collaborative scoring mode vs strict regex blocking mode and identifies score thresholds.
+- **Safe Rate Limit Probing**: Safe ramp-up up to 30 req/s with immediate early termination upon HTTP 429 and `Retry-After` extraction.
+
+### 🛡️ WAF Virtual Patching & Auto-Remediation (`--patch` / `patch` command)
+- **Instant Mitigation**: Automatically transforms detected WAF bypasses (HTTP 200) into ready-to-deploy firewall rules, reverse proxy configurations, and Infrastructure-as-Code (Terraform HCL / Cloud CLI).
+- **Supported Platforms (11 Dialects)**:
+  - **Cloudflare WAF**: Wirefilter expressions (`http.request.uri.query contains ...` / `matches ...`) & `cloudflare_ruleset` Terraform HCL.
+  - **AWS WAF v2**: Native JSON Rule Statements (`ByteMatchStatement`, `RegexPatternSet`, `OrStatement`) & `aws_wafv2_rule_group` Terraform HCL.
+  - **Google Cloud Armor**: CEL expressions (`request.path.matches(...)`, `request.headers[...]`), `gcloud compute security-policies` CLI commands, & Terraform `google_compute_security_policy`.
+  - **Azure WAF (Front Door & App Gateway)**: Custom Rule JSON definitions, `az network front-door waf-policy` CLI commands, & Terraform `azurerm_cdn_frontdoor_firewall_policy`.
+  - **ModSecurity & OWASP Coraza**: OWASP CRS-compatible `SecRule` directives (SecLang) with `@pm` token collapsing. Supported via `--patch modsecurity` or `--patch coraza`.
+  - **NGINX**: Native `location ~* \.(ext)$ { return 403; }`, `location ~ /\.(git|svn)`, and `map` configuration blocks.
+  - **HAProxy**: High-performance native ACLs (`path_end -i`, `path_beg -i`, `query -m sub -i`, `req.hdr()`) with `http-request deny deny_status 403`.
+  - **Caddy Server**: Idiomatic Caddyfile named matchers (`@waf_patch_*`) with CEL expressions (`expression {http.request.uri.query}.matches(...)`) and `respond 403`.
+  - **Apache HTTP Server**: `mod_rewrite` rules (`RewriteCond %{QUERY_STRING}` / `%{REQUEST_URI}` / `%{HTTP_USER_AGENT}` + `RewriteRule ^ - [F,L]`) for `httpd.conf`, `<VirtualHost>`, or `.htaccess`. Supported via `--patch apache`.
+  - **Envoy Proxy**: Route entries matching `:path`/headers via RE2 `safe_regex` with `direct_response: 403` (or forward-and-tag in simulate mode) for a route_configuration virtual_host. Supported via `--patch envoy`.
+  - **Kubernetes Ingress (K8s)**: Production-ready `kind: Ingress` YAML manifests with `nginx.ingress.kubernetes.io/server-snippet` annotations.
+- **Dual-Tier Defense**:
+  - **Strict Hotfix**: Exact token signatures with **0% false positive risk** for immediate zero-day incident response.
+  - **Heuristic Pattern**: Generalized regular expressions covering the entire vulnerability class structure.
+- **Web UI Remediation Studio**: Interactive dashboard modal with live previews across all vendors, 1-click clipboard copy, format toggles, and file export.
+
+### Attack Categories (28 total)
+SQL Injection, XSS, Command Injection, Path Traversal, SSRF, Local File Inclusion, Sensitive Files, Open Redirect, SSTI, XXE, NoSQL Injection, GraphQL Injection, JWT Attack (Header), JWT Attack (Param), Prototype Pollution (JSON Body), Prototype Pollution (URL/Param), LDAP Injection, XPath Injection, Spreadsheet Formula Injection, Log4Shell (JNDI), CRLF Injection, HTTP Parameter Pollution, User-Agent, IP Bypass, HTTP Request Smuggling, Web Cache Poisoning, UTF8/Unicode Bypass, WAF Inspection Limit Bypass (Padding).
 
 ### WAF Detection
-- Auto-detect WAF type before testing (Cloudflare, AWS WAF, ModSecurity, Akamai, Imperva, F5 BIG-IP, etc.).
+- Auto-detect WAF type before testing (Cloudflare, AWS WAF, OWASP Coraza, BunkerWeb, ModSecurity, Akamai, Imperva, F5 BIG-IP, etc.).
 - Suggests specific bypass techniques based on detected WAF.
 - Can auto-switch to WAF-specific advanced payloads.
 
@@ -104,6 +129,10 @@ node packages/cli/dist/index.js --help
 
 # Print check command help (lists all methods, categories, and WAF vendors)
 node packages/cli/dist/index.js check --help
+
+# Discover detectable WAF vendors and payload categories (JSON for automation)
+node packages/cli/dist/index.js list-wafs --json
+node packages/cli/dist/index.js list-categories --json
 ```
 
 #### WAF Detection
@@ -129,10 +158,13 @@ node packages/cli/dist/index.js batch targets.txt --concurrency 3
 ```
 
 #### Generating Reports
-Save audit results in **SARIF**, **HTML**, **Markdown**, **CSV**, or **JSON** format:
+Save audit results in **SARIF**, **JUnit XML**, **HTML**, **Markdown**, **CSV**, or **JSON** format:
 ```bash
 # Generate SARIF report for GitHub Code Scanning
 node packages/cli/dist/index.js check https://example.com -o results.sarif
+
+# Generate JUnit XML for CI test reporting (GitHub Actions, GitLab CI, Jenkins)
+node packages/cli/dist/index.js check https://example.com -o results.xml
 
 # Generate interactive HTML report
 node packages/cli/dist/index.js check https://example.com -o report.html
@@ -140,6 +172,7 @@ node packages/cli/dist/index.js check https://example.com -o report.html
 # Generate Markdown summary for CI
 node packages/cli/dist/index.js check https://example.com -o summary.md
 ```
+> The report format is deduced from the output file extension, or set explicitly with `-f, --format` (`json`, `csv`, `html`, `sarif`, `markdown`, `junit`). Each attack payload becomes a JUnit `<testcase>`; WAF bypasses are reported as `failure`s and transport/server errors as `error`s, so CI runners surface them directly.
 
 #### CI/CD Integration & Protection Thresholds
 Fail CI/CD pipelines when protection rate is below required threshold or when bypasses are detected:
@@ -150,6 +183,51 @@ node packages/cli/dist/index.js check https://example.com --threshold 95 -q
 # Fail immediately on any detected bypass
 node packages/cli/dist/index.js check https://example.com --fail-on-bypass -q
 ```
+
+#### 🛡️ Virtual Patching & Auto-Remediation
+Automatically generate ready-to-deploy firewall rules across all 11 supported platforms (`cloudflare`, `aws`, `gcp`, `azure`, `modsecurity`, `nginx`, `haproxy`, `caddy`, `apache`, `envoy`, `k8s`, or `all`):
+```bash
+# Generate and save Cloudflare Terraform rules during audit
+node packages/cli/dist/index.js check https://example.com --patch cloudflare --patch-output ./cloudflare-patch.tf
+
+# Generate GCP Cloud Armor gcloud commands and Terraform
+node packages/cli/dist/index.js check https://example.com --patch gcp --patch-output ./cloud-armor.sh
+
+# Generate Azure WAF rules with simulation (Log) mode
+node packages/cli/dist/index.js check https://example.com --patch azure --patch-action simulate --patch-output ./azure-rules.json
+
+# Generate HAProxy ACLs for haproxy.cfg
+node packages/cli/dist/index.js check https://example.com --patch haproxy --patch-output ./haproxy-patches.cfg
+
+# Generate Caddyfile named matchers
+node packages/cli/dist/index.js check https://example.com --patch caddy --patch-output ./patches.caddyfile
+
+# Generate Apache mod_rewrite rules for .htaccess
+node packages/cli/dist/index.js check https://example.com --patch apache --patch-output ./patches.htaccess
+
+# Generate Kubernetes Ingress YAML manifests
+node packages/cli/dist/index.js check https://example.com --patch k8s --patch-output ./ingress-patch.yaml
+
+# Generate patches for all vendors from a saved JSON audit report file
+node packages/cli/dist/index.js patch audit-report.json --waf all --output ./patches/
+```
+
+#### 🐳 Local Docker & Staging Environment Testing (`--allow-local`)
+By default, `waf-checker` strictly blocks private IP ranges (`127.0.0.1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) to prevent Server-Side Request Forgery (SSRF). When testing your own local Docker containers or staging servers, use `--allow-local`:
+```bash
+# Audit a local OWASP ModSecurity Docker container and run reverse engineering
+node packages/cli/dist/index.js check http://127.0.0.1:8088/ --allow-local --reverse
+
+# Audit a local Caddy or HAProxy reverse proxy and generate patches
+node packages/cli/dist/index.js check http://127.0.0.1:8089/ --allow-local --patch caddy
+```
+
+#### 🧪 Automated Live Docker E2E Suite (`npm run test:e2e`)
+Run end-to-end integration audits against live Docker containers (ModSecurity CRS, Caddy, HAProxy, NGINX, and Backend) in one command:
+```bash
+npm run test:e2e
+```
+See the complete [Local WAF Testing & E2E Validation Guide](docs/LOCAL_WAF_TESTING.md) for full benchmarks, architecture diagrams, and manual reproduction steps.
 
 ---
 
@@ -249,6 +327,49 @@ docker run --rm -it waf-checker-cli check https://example.com
 ```bash
 docker run --rm -it -v "$(pwd):/data" waf-checker-cli batch /data/targets.txt --concurrency 3
 ```
+
+---
+
+## 🔌 API & Integration (for External Consumers & Fuzzers)
+
+The Cloudflare Worker exposes a public REST API consumed by scanners and fuzzers (including [swazz](https://github.com/SecH0us3/swazz)). Full OpenAPI 3.1 specification is available in [`docs/openapi.yaml`](docs/openapi.yaml).
+
+### Endpoints Overview
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/waf-detect` | `GET` | Fingerprints WAF vendor, confidence score, and suggested bypasses. |
+| `/api/check` | `GET`, `POST` | Probes target with attack payloads. Supports pagination & category filtering. |
+| `/api/virtual-patch` | `POST` | Generates remediation rules for Cloudflare, AWS, ModSec, NGINX, Caddy, HAProxy, Coraza. |
+| `/api/reverse-engineer` | `GET`, `POST` | Reverse engineers OWASP CRS rules, anomaly thresholds, and body limits. |
+| `/api/audit` | `GET`, `POST` | **Unified 1-request audit**: executes detection, security checks, and virtual patches. |
+
+### Key Integration Features
+
+- **Pagination Envelope (`?envelope=1` or `?envelope=true`)**:
+  Wrap results in a structured envelope with pagination metadata:
+  ```json
+  {
+    "results": [...],
+    "page": 0,
+    "pageSize": 50,
+    "total": 72,
+    "hasMore": true
+  }
+  ```
+  *(Omit `?envelope=1` to receive the default bare JSON array for backwards compatibility).*
+
+- **Normalized Confidence (`/api/waf-detect`)**:
+  Provides `confidencePercent` (0–100) alongside raw `confidence` and `confidenceThreshold` (`40`).
+
+- **Per-Result Verdict & Block Flags**:
+  Every `AuditResultItem` includes:
+  - `blocked: boolean` — Whether the WAF intervened before reaching the origin.
+  - `verdict: 'blocked' | 'passed' | 'exposed'` — Distinct outcome differentiating between leaks (`exposed`) and coverage gaps (`passed`).
+  - `error: string | null` — Explicit error category on network drop (e.g. `'timeout'`, `'dns'`, `'connection_reset'`).
+
+- **Self-Scan Refusal (HTTP 422)**:
+  Refuses accidental self-scans targeting the service infrastructure with `{ "error": "self-scan refused", "code": "SELF_SCAN_REFUSED" }`.
 
 ---
 

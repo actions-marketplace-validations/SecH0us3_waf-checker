@@ -44,6 +44,16 @@ function renderSummary(results, falsePositiveMode = false) {
 		const status_class = getStatusClass(code, parseInt(code, 10) >= 300 && parseInt(code, 10) < 400, falsePositiveMode);
 		html += `<div class='d-flex align-items-left mb-1'><div class='min-width-112'><label><input type='checkbox' class='status-filter-checkbox checkbox-align' data-status='${code}' checked> <b>Status ${code}</b></label></div><div class='status-bar ${status_class}' style='width:${percent.toFixed(2)}%;'>${statusCounter[code]}</div></div>`;
 	}
+	// Legitimate User-Agent bypasses are counted separately: their status is 403
+	// (so they hide inside the green "Status 403" bar), but they are a real
+	// bypass — surface them with their own red indicator + filter.
+	if (!falsePositiveMode) {
+		const uaBypassCount = results.filter((r) => r.userAgentBypass && r.userAgentBypass.bypassed).length;
+		if (uaBypassCount > 0) {
+			const percent = totalRequests ? (uaBypassCount / totalRequests) * 100 : 0;
+			html += `<div class='d-flex align-items-left mb-1'><div class='min-width-112'><label><input type='checkbox' id='uaBypassFilter' class='ua-bypass-filter-checkbox checkbox-align' checked> <b title='Requests blocked with a normal User-Agent that reached the origin when spoofing a trusted bot'>🕵️ UA bypass</b></label></div><div class='status-bar status-bar-bypass' style='width:${percent.toFixed(2)}%;'>${uaBypassCount}</div></div>`;
+		}
+	}
 	html += `</div>`;
 	return html;
 }
@@ -77,6 +87,27 @@ function renderReport(results, falsePositiveMode = false) {
     </div>`;
 	}
 
+	// Legitimate User-Agent allow-list bypass alert. Distinct from the virtual-patch
+	// banner: a UA allow-list bypass isn't fixed by a payload regex rule, so it gets
+	// its own call-to-action (stop trusting the User-Agent header).
+	if (!falsePositiveMode) {
+		const uaBypasses = results.filter((r) => r.userAgentBypass && r.userAgentBypass.bypassed);
+		if (uaBypasses.length > 0) {
+			const botSet = new Set();
+			uaBypasses.forEach((r) => (r.userAgentBypass.hits || []).forEach((h) => botSet.add(h.name)));
+			const bots = Array.from(botSet).slice(0, 6).map((n) => escapeHtml(n)).join(', ');
+			const moreBots = botSet.size > 6 ? `, +${botSet.size - 6}` : '';
+			html += `<div class="alert alert-danger d-flex align-items-start gap-2 mb-3" role="alert">
+      <span style="font-size:1.4rem;line-height:1;">🕵️</span>
+      <div>
+        <strong>User-Agent Allow-List Bypass Detected (${uaBypasses.length})</strong>
+        <div class="small mt-1">${uaBypasses.length} attack request(s) were blocked with a normal User-Agent, but reached the origin once the request claimed to be a trusted bot (${bots}${moreBots}). The WAF (or origin) is trusting a spoofable User-Agent header.</div>
+        <div class="small mt-1"><b>Remediation:</b> never allow-list by User-Agent alone — verify legitimate crawlers by reverse-DNS / published IP ranges, and keep WAF rules applied to trusted bots.</div>
+      </div>
+    </div>`;
+		}
+	}
+
 	// Add WAF detection info if available
 	if (results.length > 0 && results[0].wafDetected) {
 		html += `<div class="alert alert-info mb-3">
@@ -95,14 +126,40 @@ function renderReport(results, falsePositiveMode = false) {
 		} else {
 			codeClass = r.status == 403 || r.status == '403' ? ' payload-green' : '';
 		}
+		const codeNum = parseInt(r.status, 10);
+		const isBypass = (r.status == 200 || r.status == '200') && !falsePositiveMode;
+		const isMiss = !falsePositiveMode && !isBypass && (codeNum === 404 || (codeNum >= 500 && codeNum < 600));
+		let patchBtn = '';
+		if (isBypass) {
+			patchBtn = `<button type="button" class="btn btn-sm btn-outline-danger py-0 px-1 ms-2" style="font-size:0.7rem;" onclick="showVirtualPatchModal('bypasses')" title="Remediate this bypass (200 OK)">🛡️ Patch</button>`;
+		} else if (isMiss) {
+			patchBtn = `<button type="button" class="btn btn-sm btn-outline-warning py-0 px-1 ms-2" style="font-size:0.7rem;" onclick="showVirtualPatchModal('misses')" title="Remediate this unprotected vector (WAF Miss: Status ${r.status})">🛡️ Patch</button>`;
+		}
 		const responseTime = r.responseTime || 0;
+		// Legitimate User-Agent bypass: blocked (403) with a normal UA, but let
+		// through once the request claimed to be a trusted bot. Highlight loudly.
+		let uaBadge = '';
+		let uaAttr = '';
+		if (r.userAgentBypass && r.userAgentBypass.bypassed) {
+			const hits = r.userAgentBypass.hits || [];
+			const names = hits.map((h) => h.name);
+			const shown = names.slice(0, 3).map((n) => escapeHtml(n)).join(', ');
+			const extra = names.length > 3 ? ` (+${names.length - 3})` : '';
+			const originStatus = hits.length ? hits[0].status : '';
+			const title =
+				`Blocked with a normal User-Agent (403), but reached the origin (status ${originStatus}) ` +
+				`when the request claimed to be a trusted bot: ${escapeHtml(names.join(', '))}`;
+			uaBadge = `<span class="badge bg-danger ms-2" title="${title}">🕵️ UA bypass: ${names.length} bot(s): ${shown}${extra}</span>`;
+			uaAttr = " data-ua-bypass='1'";
+		}
+		const rowClass = uaBadge ? ' class="ua-bypass-row"' : '';
 		html +=
-			`<tr data-status='${r.status}'>` +
-			`<td>${r.category}</td>` +
-			`<td class='text-center'>${r.method}</td>` +
-			`<td class='${status_class} text-center'>${r.status}</td>` +
-			`<td class='text-center'>${responseTime}ms</td>` +
-			`<td><code class='${codeClass}'>${escapeHtml(r.payload)}</code></td>` +
+			`<tr data-status='${r.status}'${uaAttr}${rowClass}>` +
+			`<td data-label='Category'>${r.category}</td>` +
+			`<td class='text-center' data-label='Method'>${r.method}</td>` +
+			`<td class='${status_class} text-center' data-label='Status'>${r.status}</td>` +
+			`<td class='text-center' data-label='Response Time'>${responseTime}ms</td>` +
+			`<td data-label='Payload'><code class='${codeClass}'>${escapeHtml(r.payload)}</code>${patchBtn}${uaBadge}</td>` +
 			`</tr>`;
 	}
 	html += `</table>`;
@@ -272,6 +329,21 @@ function togglePaddingSizeSelect() {
 	}
 }
 
+// Show/hide the secondary action buttons on mobile (they are collapsed behind
+// the ⋯ toggle to keep the header compact). On desktop the row is always shown
+// and the toggle is hidden via CSS, so this is a no-op there.
+function toggleActionButtons() {
+	const row = document.getElementById('actionButtonsRow');
+	const btn = document.getElementById('moreActionsToggle');
+	if (!row) return;
+	const expanded = row.classList.toggle('expanded');
+	if (btn) {
+		btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+		btn.textContent = expanded ? '✕' : '⋯';
+		btn.title = expanded ? 'Hide actions' : 'More actions';
+	}
+}
+
 async function fetchResults() {
 	const btn = document.getElementById('checkBtn');
 	btn.disabled = true;
@@ -309,6 +381,10 @@ async function fetchResults() {
 	// Buffer Padding Evasion
 	const enablePadding = document.getElementById('enablePadding')?.checked ? true : false;
 	const paddingSize = document.getElementById('paddingSizeSelect')?.value || '16kb';
+	// Legitimate User-Agent bypass test (on by default). Replays blocked (403)
+	// requests as Googlebot/Slackbot/etc. to catch User-Agent allow-list bypasses.
+	const spoofUserAgentEl = document.getElementById('spoofUserAgent');
+	const spoofUserAgent = spoofUserAgentEl ? spoofUserAgentEl.checked : true;
 	// Collect selected categories
 	const categoryCheckboxes = document.querySelectorAll('#categoryCheckboxes input[type=checkbox]');
 	const selectedCategories = Array.from(categoryCheckboxes)
@@ -328,6 +404,7 @@ async function fetchResults() {
 	localStorage.setItem('wafchecker_httpManipulation', httpManipulation ? '1' : '0');
 	localStorage.setItem('wafchecker_enablePadding', enablePadding ? '1' : '0');
 	localStorage.setItem('wafchecker_paddingSize', paddingSize);
+	localStorage.setItem('wafchecker_spoofUserAgent', spoofUserAgent ? '1' : '0');
 	// --- Получаем шаблон и заголовки ---\n
 	let payloadTemplate = '';
 	const templateEl = document.getElementById('payloadTemplate');
@@ -383,6 +460,7 @@ async function fetchResults() {
 				httpManipulation: httpManipulation ? '1' : '0',
 				enablePadding: enablePadding ? '1' : '0',
 				paddingSize: paddingSize,
+				spoofUserAgent: spoofUserAgent ? '1' : '0',
 				detectedWAF: detectedWAFType || '',
 			});
 			const resp = await fetch(`/api/check?${params.toString()}`, {
@@ -427,6 +505,43 @@ async function fetchResults() {
 			},
 		};
 
+		window.latestScanResults = allResults;
+		const bypasses = allResults.filter((r) => r.status === 200 || r.status === '200');
+		const misses = allResults.filter((r) => {
+			const s = parseInt(String(r.status), 10);
+			return s === 404 || (s >= 500 && s < 600);
+		});
+		const vpBanner = document.getElementById('virtualPatchBanner');
+		const vpCountBadge = document.getElementById('virtualPatchBypassCount');
+		const vpTitle = document.getElementById('virtualPatchBannerTitle');
+		const vpSubtitle = document.getElementById('virtualPatchBannerSubtitle');
+		if (vpBanner && vpCountBadge) {
+			if ((bypasses.length > 0 || misses.length > 0) && !falsePositiveTest) {
+				if (bypasses.length > 0) {
+					vpCountBadge.textContent = bypasses.length;
+					if (vpTitle) {
+						vpTitle.textContent = misses.length > 0
+							? `WAF Bypass(es) & ${misses.length} Unprotected Miss(es) Detected!`
+							: 'WAF Bypass(es) Detected!';
+					}
+					if (vpSubtitle) {
+						vpSubtitle.textContent = 'Generate instant virtual patches for Cloudflare, AWS WAF, ModSecurity, and NGINX to mitigate these risks immediately.';
+					}
+				} else {
+					vpCountBadge.textContent = misses.length;
+					if (vpTitle) {
+						vpTitle.textContent = 'Unprotected Attack Vectors (404/5xx) Detected!';
+					}
+					if (vpSubtitle) {
+						vpSubtitle.textContent = 'These attack requests reached your origin server without WAF interception. Generate perimeter rules to block them.';
+					}
+				}
+				vpBanner.style.display = 'flex';
+			} else {
+				vpBanner.style.display = 'none';
+			}
+		}
+
 		document.getElementById('results').innerHTML = renderReport(allResults, falsePositiveTest);
 		document.getElementById('results').scrollIntoView({ behavior: 'smooth' });
 		highlightCategoryCheckboxesByResults(allResults, falsePositiveTest);
@@ -450,6 +565,410 @@ async function fetchResults() {
         if (cancelBtn) cancelBtn.style.display = 'none';
         currentAbortController = null;
 	}
+}
+
+async function runReverseEngineering() {
+    const btn = document.getElementById('reverseEngineerBtn');
+    if (!btn) return;
+    btn.disabled = true;
+    const oldText = btn.innerHTML;
+    btn.innerHTML = 'Wait...';
+    const cancelBtn = document.getElementById('cancelBtn');
+    if (cancelBtn) cancelBtn.style.display = 'flex';
+    
+    const url = document.getElementById('url').value;
+    if (!url) {
+        alert("Please enter a URL first.");
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+        if (cancelBtn) cancelBtn.style.display = 'none';
+        return;
+    }
+
+    try {
+        currentAbortController = new AbortController();
+        const response = await fetch('/api/reverse-engineer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+            signal: currentAbortController.signal
+        });
+
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(err);
+        }
+
+        const report = await response.json();
+        renderReverseEngineering(report);
+        
+    } catch (e) {
+        if (e.name === 'AbortError') {
+            alert('Reverse engineering cancelled.');
+        } else {
+            console.error('Reverse engineering error:', e);
+            alert('Error: ' + e.message);
+        }
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+        if (cancelBtn) cancelBtn.style.display = 'none';
+        currentAbortController = null;
+    }
+}
+
+function renderReverseEngineering(report) {
+    const panel = document.getElementById('reverseEngineeringPanel');
+    const container = document.getElementById('reverseEngineeringResults');
+    if (!panel || !container) return;
+    
+    let html = `<div class="row mb-3">`;
+    // Body Limit
+    html += `<div class="col-md-4 mb-2">
+        <div class="card bg-subtle border-primary h-100">
+            <div class="card-body py-2 px-3">
+                <small class="text-muted d-block text-uppercase fw-bold" style="font-size: 0.7rem">Body Inspection Limit</small>
+                <div class="fw-bold fs-5">${escapeHtml(String(report.bodyInspectionLimit || 'Unknown'))}</div>
+                <small class="text-muted">Detected Threshold</small>
+            </div>
+        </div>
+    </div>`;
+    // Scoring Mode
+    html += `<div class="col-md-4 mb-2">
+        <div class="card bg-subtle border-primary h-100">
+            <div class="card-body py-2 px-3">
+                <small class="text-muted d-block text-uppercase fw-bold" style="font-size: 0.7rem">Scoring Mode</small>
+                <div class="fw-bold fs-5" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${escapeHtml(report.anomalyScoringMode.mode)}">${escapeHtml(report.anomalyScoringMode.mode.replace('_', ' '))}</div>
+                <small class="text-muted">Threshold: ${escapeHtml(String(report.anomalyScoringMode.detectedThreshold || 'N/A'))}</small>
+            </div>
+        </div>
+    </div>`;
+    // Rate Limiting
+    const rLimitStr = report.rateLimiting.triggered ? `Blocked at ${report.rateLimiting.triggeredAtReqPerSec} req/s` : 'Not Triggered';
+    html += `<div class="col-md-4 mb-2">
+        <div class="card bg-subtle border-primary h-100">
+            <div class="card-body py-2 px-3">
+                <small class="text-muted d-block text-uppercase fw-bold" style="font-size: 0.7rem">Rate Limiting</small>
+                <div class="fw-bold fs-5">${escapeHtml(rLimitStr)}</div>
+                <small class="text-muted">Retry-After: ${report.rateLimiting.retryAfter ? escapeHtml(String(report.rateLimiting.retryAfter)) + 's' : 'N/A'}</small>
+            </div>
+        </div>
+    </div>`;
+    html += `</div>`;
+    
+    // Summary
+    const activeRules = report.crs.filter(r => r.status === 'active').length;
+    const bypassRules = report.crs.filter(r => r.status === 'bypassed').length;
+    const totalRules = report.crs.length;
+    const protectionRate = totalRules ? Math.round((activeRules / totalRules) * 100) : 0;
+    
+    html += `<div class="mb-3">
+        <strong>CRS Active Rules:</strong> ${activeRules} / ${totalRules} (${protectionRate}% Protection)
+    </div>`;
+    
+    // Table
+    html += `<div class="table-responsive"><table class="table table-sm table-bordered table-striped" style="font-size: 0.85rem;">
+        <thead class="table-dark">
+            <tr>
+                <th>Rule ID</th>
+                <th>Category</th>
+                <th>Name</th>
+                <th>Status</th>
+                <th>Response Time</th>
+            </tr>
+        </thead>
+        <tbody>`;
+        
+    for (const item of report.crs) {
+        let badgeClass = 'bg-secondary';
+        if (item.status === 'active') badgeClass = 'bg-success';
+        if (item.status === 'bypassed') badgeClass = 'bg-danger';
+        
+        html += `<tr>
+            <td><code>${escapeHtml(item.ruleId)}</code> (PL${escapeHtml(String(item.paranoiaLevel))})</td>
+            <td>${escapeHtml(item.category)}</td>
+            <td>${escapeHtml(item.name)}</td>
+            <td><span class="badge ${badgeClass}">${escapeHtml(item.status.toUpperCase())}</span></td>
+            <td>${escapeHtml(String(item.responseTime))}ms</td>
+        </tr>`;
+    }
+    
+    html += `</tbody></table></div>`;
+    
+    container.innerHTML = html;
+    panel.style.display = 'block';
+    
+    window.latestReverseReport = report;
+}
+
+// --- WAF Virtual Patching Studio Controller ---
+let currentVpVendor = 'cloudflare';
+let currentVpReport = null;
+
+async function showVirtualPatchModal(initialScope) {
+	const results = window.latestScanResults || [];
+	const modalEl = document.getElementById('virtualPatchModal');
+	if (!modalEl) return;
+
+	const modal = new bootstrap.Modal(modalEl);
+
+	const bypasses = results.filter((r) => r.status === 200 || r.status === '200');
+	const misses = results.filter((r) => {
+		const s = parseInt(String(r.status), 10);
+		return s === 404 || (s >= 500 && s < 600);
+	});
+
+	const scopeSelect = document.getElementById('vpVectorScopeSelect');
+	if (scopeSelect) {
+		if (initialScope === 'misses') {
+			scopeSelect.value = 'misses';
+		} else if (initialScope === 'all') {
+			scopeSelect.value = 'all';
+		} else if (initialScope === 'bypasses') {
+			scopeSelect.value = 'bypasses';
+		} else {
+			scopeSelect.value = bypasses.length > 0 ? 'bypasses' : misses.length > 0 ? 'all' : 'bypasses';
+		}
+	}
+
+	const noBypassesAlert = document.getElementById('vpNoBypassesAlert');
+	const contentContainer = document.getElementById('vpContentContainer');
+
+	if (bypasses.length === 0 && misses.length === 0) {
+		if (noBypassesAlert) {
+			noBypassesAlert.style.display = 'block';
+			noBypassesAlert.textContent = 'All tested attack payloads were successfully blocked by the WAF (403 Forbidden). No patches required!';
+		}
+		if (contentContainer) contentContainer.style.display = 'none';
+		const badge = document.getElementById('vpRuleCountBadge');
+		if (badge) badge.textContent = '0 vectors to patch';
+		const copyBtn = document.getElementById('vpCopyBtn');
+		if (copyBtn) copyBtn.disabled = true;
+		const downloadBtn = document.getElementById('vpDownloadBtn');
+		if (downloadBtn) downloadBtn.disabled = true;
+		modal.show();
+		return;
+	}
+
+	if (noBypassesAlert) noBypassesAlert.style.display = 'none';
+	if (contentContainer) contentContainer.style.display = 'block';
+	const copyBtn = document.getElementById('vpCopyBtn');
+	if (copyBtn) copyBtn.disabled = false;
+	const downloadBtn = document.getElementById('vpDownloadBtn');
+	if (downloadBtn) downloadBtn.disabled = false;
+
+	// Auto-detect vendor if available
+	const detectedWAF = (window.detectedWAF || '').toLowerCase();
+	if (detectedWAF.includes('cloudflare')) {
+		currentVpVendor = 'cloudflare';
+	} else if (detectedWAF.includes('aws') || detectedWAF.includes('amazon')) {
+		currentVpVendor = 'aws';
+	} else if (detectedWAF.includes('cloud armor') || detectedWAF.includes('gcp') || detectedWAF.includes('google')) {
+		currentVpVendor = 'gcp';
+	} else if (detectedWAF.includes('azure') || detectedWAF.includes('front door')) {
+		currentVpVendor = 'azure';
+	} else if (detectedWAF.includes('haproxy')) {
+		currentVpVendor = 'haproxy';
+	} else if (detectedWAF.includes('modsecurity') || detectedWAF.includes('coraza')) {
+		currentVpVendor = 'modsecurity';
+	} else if (detectedWAF.includes('nginx')) {
+		currentVpVendor = 'nginx';
+	} else if (detectedWAF.includes('apache') || detectedWAF.includes('httpd')) {
+		currentVpVendor = 'apache';
+	} else if (detectedWAF.includes('envoy') || detectedWAF.includes('istio')) {
+		currentVpVendor = 'envoy';
+	}
+
+	updateVpTabs();
+	await refreshVpCode();
+	modal.show();
+}
+
+function updateVpTabs() {
+	const vendors = ['cloudflare', 'aws', 'gcp', 'azure', 'modsecurity', 'nginx', 'haproxy', 'caddy', 'apache', 'envoy', 'k8s'];
+	vendors.forEach((v) => {
+		const btn = document.getElementById(`tab-${v}`);
+		if (btn) {
+			if (v === currentVpVendor) {
+				btn.classList.add('active');
+			} else {
+				btn.classList.remove('active');
+			}
+		}
+	});
+
+	// Toggle Terraform, gcloud, and azureCli option visibility
+	const formatContainer = document.getElementById('vpFormatContainer');
+	const formatSelect = document.getElementById('vpFormatSelect');
+	if (formatContainer && formatSelect) {
+		const supportsTf = currentVpVendor === 'cloudflare' || currentVpVendor === 'aws' || currentVpVendor === 'gcp' || currentVpVendor === 'azure';
+		const supportsGcloud = currentVpVendor === 'gcp';
+		const supportsAzureCli = currentVpVendor === 'azure';
+
+		const tfOpt = formatSelect.querySelector('option[value="terraform"]');
+		const gcloudOpt = formatSelect.querySelector('option[value="gcloud"]');
+		const azureCliOpt = formatSelect.querySelector('option[value="azureCli"]');
+		if (tfOpt) tfOpt.style.display = supportsTf ? 'block' : 'none';
+		if (gcloudOpt) gcloudOpt.style.display = supportsGcloud ? 'block' : 'none';
+		if (azureCliOpt) azureCliOpt.style.display = supportsAzureCli ? 'block' : 'none';
+
+		formatContainer.style.display = (supportsTf || supportsGcloud || supportsAzureCli) ? 'block' : 'none';
+		if (!supportsTf && formatSelect.value === 'terraform') {
+			formatSelect.value = 'native';
+		}
+		if (!supportsGcloud && formatSelect.value === 'gcloud') {
+			formatSelect.value = 'native';
+		}
+		if (!supportsAzureCli && formatSelect.value === 'azureCli') {
+			formatSelect.value = 'native';
+		}
+	}
+}
+
+function selectVpVendor(vendor) {
+	currentVpVendor = vendor;
+	updateVpTabs();
+	renderVpCode();
+}
+
+async function refreshVpCode() {
+	const results = window.latestScanResults || [];
+	const urlInput = document.getElementById('url');
+	const targetUrl = urlInput ? urlInput.value : '';
+
+	const vectorScope = document.getElementById('vpVectorScopeSelect')?.value || 'bypasses';
+	const tier = document.getElementById('vpTierSelect')?.value || 'both';
+	const action = document.getElementById('vpActionSelect')?.value || 'block';
+	const scopeToPath = document.getElementById('vpScopeCheckbox')?.checked || false;
+
+	let payloadResults = results;
+	let includeMisses = false;
+	if (vectorScope === 'bypasses') {
+		payloadResults = results.filter((r) => r.status === 200 || r.status === '200');
+	} else if (vectorScope === 'misses') {
+		payloadResults = results.filter((r) => {
+			const s = parseInt(String(r.status), 10);
+			return s === 404 || (s >= 500 && s < 600);
+		});
+		includeMisses = true;
+	} else if (vectorScope === 'all') {
+		includeMisses = true;
+	}
+
+	try {
+		const res = await fetch('/api/virtual-patch', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				results: payloadResults,
+				options: {
+					vendor: 'all',
+					tier,
+					action,
+					scopeToPath,
+					targetUrl,
+					includeMisses,
+				},
+			}),
+		});
+
+		if (!res.ok) {
+			const err = await res.text();
+			throw new Error(err);
+		}
+
+		currentVpReport = await res.json();
+		renderVpCode();
+	} catch (err) {
+		console.error('Error fetching virtual patches:', err);
+		const viewer = document.getElementById('vpCodeViewer');
+		if (viewer) viewer.textContent = `Error generating patches: ${err.message}`;
+	}
+}
+
+function renderVpCode() {
+	if (!currentVpReport) return;
+
+	const format = document.getElementById('vpFormatSelect')?.value || 'native';
+	const bundle = currentVpReport.bundles?.[currentVpVendor];
+	const viewer = document.getElementById('vpCodeViewer');
+	const countBadge = document.getElementById('vpRuleCountBadge');
+
+	if (!bundle || bundle.ruleCount === 0) {
+		if (viewer) viewer.textContent = `# No patches generated for ${currentVpVendor.toUpperCase()}`;
+		if (countBadge) countBadge.textContent = '0 rules';
+		return;
+	}
+
+	if (countBadge) {
+		countBadge.textContent = `${bundle.ruleCount} rule(s) generated`;
+	}
+
+	let content = bundle.native;
+	if (format === 'terraform' && bundle.terraform) {
+		content = bundle.terraform;
+	} else if (format === 'gcloud' && bundle.gcloud) {
+		content = bundle.gcloud;
+	} else if (format === 'azureCli' && bundle.azureCli) {
+		content = bundle.azureCli;
+	}
+
+	if (viewer) {
+		viewer.textContent = content;
+	}
+}
+
+function copyVpCode() {
+	const viewer = document.getElementById('vpCodeViewer');
+	if (!viewer || !viewer.textContent) return;
+
+	navigator.clipboard.writeText(viewer.textContent).then(() => {
+		const btn = document.getElementById('vpCopyBtn');
+		if (btn) {
+			const originalHtml = btn.innerHTML;
+			btn.innerHTML = '✓ Copied!';
+			btn.classList.replace('btn-primary', 'btn-success');
+			setTimeout(() => {
+				btn.innerHTML = originalHtml;
+				btn.classList.replace('btn-success', 'btn-primary');
+			}, 2000);
+		}
+	});
+}
+
+function downloadVpCode() {
+	const viewer = document.getElementById('vpCodeViewer');
+	if (!viewer || !viewer.textContent) return;
+
+	const format = document.getElementById('vpFormatSelect')?.value || 'native';
+	let ext = '.conf';
+	if (format === 'terraform') {
+		ext = '.tf';
+	} else if (format === 'gcloud' || format === 'azureCli') {
+		ext = '.sh';
+	} else if (currentVpVendor === 'aws' || currentVpVendor === 'azure') {
+		ext = '.json';
+	} else if (currentVpVendor === 'gcp') {
+		ext = '.cel';
+	} else if (currentVpVendor === 'haproxy') {
+		ext = '.cfg';
+	} else if (currentVpVendor === 'caddy') {
+		ext = '.caddyfile';
+	} else if (currentVpVendor === 'apache') {
+		ext = '.htaccess';
+	} else if (currentVpVendor === 'envoy') {
+		ext = '.yaml';
+	} else if (currentVpVendor === 'k8s') {
+		ext = '.yaml';
+	}
+
+	const filename = `${currentVpVendor}-virtual-patches${ext}`;
+	const blob = new Blob([viewer.textContent], { type: 'text/plain;charset=utf-8' });
+	const a = document.createElement('a');
+	a.href = URL.createObjectURL(blob);
+	a.download = filename;
+	a.click();
+	URL.revokeObjectURL(a.href);
 }
 
 function restoreStateFromLocalStorage() {
@@ -554,6 +1073,15 @@ function restoreStateFromLocalStorage() {
 		const el = document.getElementById('paddingSizeSelect');
 		if (el) {
 			el.value = paddingSize;
+		}
+	}
+
+	// Legit User-Agent bypass test (defaults to on when never set)
+	const spoofUserAgent = localStorage.getItem('wafchecker_spoofUserAgent');
+	if (spoofUserAgent !== null) {
+		const el = document.getElementById('spoofUserAgent');
+		if (el) {
+			el.checked = spoofUserAgent === '1';
 		}
 	}
 
@@ -969,6 +1497,10 @@ function initApp() {
 				}
 				filterResultsTableByStatus();
 			}
+			// UA-bypass filter toggle
+			if (target && target.classList.contains('ua-bypass-filter-checkbox')) {
+				filterResultsTableByStatus();
+			}
 		});
 	}
 }
@@ -988,9 +1520,16 @@ function filterResultsTableByStatus() {
 	const checkedStatuses = Array.from(document.querySelectorAll('.status-filter-checkbox:checked')).map((cb) =>
 		cb.getAttribute('data-status'),
 	);
+	// A UA-bypass row's status is 403, so it would vanish when the user unchecks
+	// "Status 403" to focus on problems — exactly when they want to see it. Keep
+	// it visible whenever its own filter is on, regardless of the status filters.
+	const uaFilter = document.getElementById('uaBypassFilter');
+	const uaFilterOn = !uaFilter || uaFilter.checked;
 	const rows = document.querySelectorAll('#resultsTable tr[data-status]');
 	rows.forEach((row) => {
-		if (checkedStatuses.includes(row.getAttribute('data-status'))) {
+		const statusVisible = checkedStatuses.includes(row.getAttribute('data-status'));
+		const isUaBypass = row.getAttribute('data-ua-bypass') === '1';
+		if (statusVisible || (isUaBypass && uaFilterOn)) {
 			row.style.display = '';
 		} else {
 			row.style.display = 'none';

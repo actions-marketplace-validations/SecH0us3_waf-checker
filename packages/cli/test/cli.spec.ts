@@ -39,7 +39,9 @@ vi.mock('fs', async () => {
 				return mockFileContent;
 			}
 			return actual.readFileSync(path, options);
-		})
+		}),
+		writeFileSync: vi.fn(),
+		mkdirSync: vi.fn(),
 	};
 });
 
@@ -103,6 +105,40 @@ describe('CLI Argument Processing', () => {
 		expect(commandNames).toContain('detect');
 		expect(commandNames).toContain('check');
 		expect(commandNames).toContain('batch');
+	});
+
+	describe('list commands', () => {
+		it('should register list-wafs and list-categories commands', () => {
+			const commandNames = program.commands.map(cmd => cmd.name());
+			expect(commandNames).toContain('list-wafs');
+			expect(commandNames).toContain('list-categories');
+		});
+
+		it('list-wafs --json prints a JSON array of vendors', async () => {
+			await program.parseAsync(['node', 'index.js', 'list-wafs', '--json']);
+			const out = consoleLogSpy.mock.calls.map((c: any[]) => c[0]).join('\n');
+			const parsed = JSON.parse(out);
+			expect(Array.isArray(parsed)).toBe(true);
+			expect(parsed).toContain('Cloudflare');
+			expect(exitCode).toBeNull();
+		});
+
+		it('list-categories --json prints objects with name and type', async () => {
+			await program.parseAsync(['node', 'index.js', 'list-categories', '--json']);
+			const out = consoleLogSpy.mock.calls.map((c: any[]) => c[0]).join('\n');
+			const parsed = JSON.parse(out);
+			expect(Array.isArray(parsed)).toBe(true);
+			expect(parsed.length).toBeGreaterThan(0);
+			expect(parsed.every((c: any) => typeof c.name === 'string' && typeof c.type === 'string')).toBe(true);
+			expect(exitCode).toBeNull();
+		});
+
+		it('list-wafs (text mode) prints a human-readable list', async () => {
+			await program.parseAsync(['node', 'index.js', 'list-wafs']);
+			const out = consoleLogSpy.mock.calls.map((c: any[]) => c[0]).join('\n');
+			expect(out).toContain('Supported WAF vendors');
+			expect(out).toContain('Cloudflare');
+		});
 	});
 
 	describe('detect command', () => {
@@ -389,7 +425,7 @@ describe('CLI Argument Processing', () => {
 				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--output', 'report.html'])
 			).resolves.toBeDefined();
 
-			expect(writeReport).toHaveBeenCalledWith('report.html', 'html', 'check', 'https://example.com', expect.any(Array));
+			expect(writeReport).toHaveBeenCalledWith('report.html', 'html', 'check', 'https://example.com', expect.any(Array), undefined, undefined);
 		});
 
 		it('should write sarif report when .sarif extension is specified', async () => {
@@ -397,7 +433,7 @@ describe('CLI Argument Processing', () => {
 				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--output', 'report.sarif'])
 			).resolves.toBeDefined();
 
-			expect(writeReport).toHaveBeenCalledWith('report.sarif', 'sarif', 'check', 'https://example.com', expect.any(Array));
+			expect(writeReport).toHaveBeenCalledWith('report.sarif', 'sarif', 'check', 'https://example.com', expect.any(Array), undefined, undefined);
 		});
 
 		it('should write multiple reports simultaneously when flags are specified', async () => {
@@ -410,9 +446,29 @@ describe('CLI Argument Processing', () => {
 				])
 			).resolves.toBeDefined();
 
-			expect(writeReport).toHaveBeenCalledWith('results.sarif', 'sarif', 'check', 'https://example.com', expect.any(Array));
-			expect(writeReport).toHaveBeenCalledWith('summary.md', 'markdown', 'check', 'https://example.com', expect.any(Array));
-			expect(writeReport).toHaveBeenCalledWith('report.html', 'html', 'check', 'https://example.com', expect.any(Array));
+			expect(writeReport).toHaveBeenCalledWith('results.sarif', 'sarif', 'check', 'https://example.com', expect.any(Array), undefined, undefined);
+			expect(writeReport).toHaveBeenCalledWith('summary.md', 'markdown', 'check', 'https://example.com', expect.any(Array), undefined, undefined);
+			expect(writeReport).toHaveBeenCalledWith('report.html', 'html', 'check', 'https://example.com', expect.any(Array), undefined, undefined);
+		});
+
+		it('should execute reverse engineering audit when --reverse flag is set', async () => {
+			const mockReverseReport = {
+				targetUrl: 'https://example.com',
+				crsRules: [],
+				crsSummary: { total: 10, active: 8, disabled: 2, bypassed: 0, activePercent: 80 },
+				bodyLimit: { detected: true, limitBytes: 16384, limitFormatted: '16 KB', confidence: 95 },
+				anomalyScore: { mode: 'anomaly_scoring' as const, detectedThreshold: 5, confidence: 95 },
+				rateLimit: { detected: false, thresholdRps: null, retryAfterSeconds: null, safeTestedMaxRps: 30 },
+				timestamp: new Date().toISOString(),
+			};
+			vi.spyOn(core, 'runReverseEngineeringAudit').mockResolvedValueOnce(mockReverseReport);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--reverse', '--output', 'report.json'])
+			).resolves.toBeDefined();
+
+			expect(core.runReverseEngineeringAudit).toHaveBeenCalledWith('https://example.com', expect.any(Object));
+			expect(writeReport).toHaveBeenCalledWith('report.json', 'json', 'check', 'https://example.com', expect.any(Array), mockReverseReport, undefined);
 		});
 
 		it('should pass quiet option when --quiet is set', async () => {
@@ -499,6 +555,65 @@ describe('CLI Argument Processing', () => {
 			).resolves.toBeDefined();
 
 			expect(exitCode).toBeNull();
+		});
+
+		it('should exit with 1 on a User-Agent allow-list bypass when --fail-on-bypass is specified', async () => {
+			// Baseline blocked (403), but a trusted UA got through — a real bypass.
+			vi.mocked(core.handleApiCheckFiltered).mockResolvedValueOnce([
+				{
+					status: 403, method: 'GET', payload: 'test', responseTime: 120, category: 'SQL Injection',
+					userAgentBypass: { bypassed: true, tested: 16, hits: [{ name: 'Googlebot', userAgent: 'ua', status: 200, verdict: 'passed' }] },
+				},
+			]);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--fail-on-bypass'])
+			).rejects.toThrow('process.exit(1)');
+
+			expect(exitCode).toBe(1);
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('User-Agent allow-list bypass'));
+		});
+
+		it('should fail --threshold on a User-Agent allow-list bypass even when the score is 100%', async () => {
+			// The only result is blocked (403) → protectionScore is 100%, so the score
+			// gate passes; the UA bypass must fail the build on its own.
+			vi.mocked(core.handleApiCheckFiltered).mockResolvedValueOnce([
+				{
+					status: 403, method: 'GET', payload: 'test', responseTime: 120, category: 'SQL Injection',
+					userAgentBypass: { bypassed: true, tested: 16, hits: [{ name: 'Slackbot', userAgent: 'ua', status: 200, verdict: 'passed' }] },
+				},
+			]);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--threshold', '90'])
+			).rejects.toThrow('process.exit(1)');
+
+			expect(exitCode).toBe(1);
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('User-Agent allow-list bypass'));
+		});
+
+		it('should report a User-Agent bypass and not print a perfect score', async () => {
+			vi.mocked(core.handleApiCheckFiltered).mockResolvedValueOnce([
+				{
+					status: 403, method: 'GET', payload: 'test', responseTime: 120, category: 'SQL Injection',
+					userAgentBypass: {
+						bypassed: true, tested: 16,
+						hits: [
+							{ name: 'Googlebot', userAgent: 'ua1', status: 200, verdict: 'passed' },
+							{ name: 'Slackbot', userAgent: 'ua2', status: 200, verdict: 'passed' },
+						],
+					},
+				},
+			]);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com'])
+			).resolves.toBeDefined();
+
+			expect(exitCode).toBeNull();
+			const logged = consoleLogSpy.mock.calls.map((c: any[]) => c.join(' ')).join('\n');
+			expect(logged).toContain('USER-AGENT ALLOW-LIST BYPASSES DETECTED');
+			expect(logged).not.toContain('Perfect Score');
 		});
 	});
 
@@ -615,6 +730,240 @@ describe('CLI Argument Processing', () => {
 			).resolves.toBeDefined();
 
 			expect(exitCode).toBeNull();
+		});
+	});
+
+	describe('patch command and virtual patching in check', () => {
+		it('should generate virtual patches during check when --patch is specified', async () => {
+			vi.spyOn(core, 'handleApiCheckFiltered').mockResolvedValueOnce([
+				{
+					category: 'SQL Injection',
+					method: 'GET',
+					payload: "' UNION SELECT 1",
+					status: 200,
+					responseTime: 50,
+				},
+			]);
+
+			await expect(
+				program.parseAsync([
+					'node', 'index.js', 'check', 'https://example.com',
+					'--patch', 'cloudflare',
+					'--patch-output', 'cloudflare-patch.tf',
+				])
+			).resolves.toBeDefined();
+
+			expect(fs.writeFileSync).toHaveBeenCalledWith(
+				expect.stringContaining('cloudflare-patch.tf'),
+				expect.stringContaining('cloudflare_ruleset'),
+				'utf8'
+			);
+		});
+
+		it('should fail patch command when input file does not exist', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(false);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'non-existent-report.json'])
+			).rejects.toThrow('process.exit(1)');
+
+			expect(exitCode).toBe(1);
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('does not exist'));
+		});
+
+		it('should generate patches from saved report file and output to terminal', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+			vi.mocked(fs.readFileSync).mockReturnValueOnce(
+				JSON.stringify({
+					targetUrl: 'https://example.com/api',
+					results: [
+						{
+							category: 'SQL Injection',
+							method: 'GET',
+							payload: "' UNION SELECT 1",
+							status: 200,
+							responseTime: 50,
+						},
+						{
+							category: 'XSS',
+							method: 'GET',
+							payload: '<script>alert(1)</script>',
+							status: 200,
+							responseTime: 40,
+						},
+					],
+				})
+			);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json', '--waf', 'aws'])
+			).resolves.toBeDefined();
+
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('AWS'));
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('Detected Bypasses to Remediate: 2'));
+		});
+
+		it('should output json format when --json flag is passed to patch command', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+			vi.mocked(fs.readFileSync).mockReturnValueOnce(
+				JSON.stringify([
+					{
+						category: 'Path Traversal',
+						method: 'GET',
+						payload: '../../etc/passwd',
+						status: 200,
+						responseTime: 40,
+					},
+				])
+			);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json', '--json'])
+			).resolves.toBeDefined();
+
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('"totalBypasses": 1'));
+		});
+
+		it('should write patches to specified output file', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+			vi.mocked(fs.readFileSync).mockReturnValueOnce(
+				JSON.stringify([
+					{
+						category: 'SQL Injection',
+						method: 'GET',
+						payload: "' OR 1=1--",
+						status: 200,
+						responseTime: 40,
+					},
+				])
+			);
+
+			await expect(
+				program.parseAsync([
+					'node', 'index.js', 'patch', 'report.json',
+					'--waf', 'modsecurity',
+					'--output', 'modsec-rules.conf',
+				])
+			).resolves.toBeDefined();
+
+			expect(fs.writeFileSync).toHaveBeenCalledWith(
+				expect.stringContaining('modsec-rules.conf'),
+				expect.stringContaining('SecRule'),
+				'utf8'
+			);
+		});
+
+		it('should handle reports with 0 bypasses gracefully in patch command', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+			vi.mocked(fs.readFileSync).mockReturnValueOnce(
+				JSON.stringify([
+					{
+						category: 'SQL Injection',
+						method: 'GET',
+						payload: "' OR 1=1--",
+						status: 403,
+						responseTime: 40,
+					},
+				])
+			);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json'])
+			).resolves.toBeDefined();
+
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('No bypasses detected'));
+		});
+
+		it('should generate patches for 404 responses when --include-misses is specified in patch command', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+			vi.mocked(fs.readFileSync).mockReturnValueOnce(
+				JSON.stringify([
+					{
+						category: 'Sensitive Files',
+						method: 'GET',
+						payload: '/.git/config',
+						status: 404,
+						responseTime: 40,
+					},
+				])
+			);
+
+			await expect(
+				program.parseAsync([
+					'node',
+					'index.js',
+					'patch',
+					'report.json',
+					'--include-misses',
+					'--waf',
+					'cloudflare',
+				])
+			).resolves.toBeDefined();
+
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('CLOUDFLARE'));
+		});
+
+		it('should generate GCP Cloud Armor patches when --waf gcp is specified', async () => {
+			vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+			vi.mocked(fs.readFileSync).mockReturnValueOnce(
+				JSON.stringify([
+					{
+						category: 'Sensitive Files',
+						method: 'GET',
+						payload: '/dump.sql',
+						status: 200,
+						responseTime: 40,
+					},
+				])
+			);
+
+			await expect(
+				program.parseAsync([
+					'node',
+					'index.js',
+					'patch',
+					'report.json',
+					'--waf',
+					'gcp',
+				])
+			).resolves.toBeDefined();
+
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('GCP'));
+		});
+
+		it('should generate Azure, HAProxy, Caddy, and K8s patches when specific --waf is specified', async () => {
+			vi.mocked(fs.existsSync).mockReturnValue(true);
+			vi.mocked(fs.readFileSync).mockReturnValue(
+				JSON.stringify([
+					{
+						category: 'Sensitive Files',
+						method: 'GET',
+						payload: '/dump.sql',
+						status: 200,
+						responseTime: 40,
+					},
+				])
+			);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json', '--waf', 'azure'])
+			).resolves.toBeDefined();
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('AZURE'));
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json', '--waf', 'haproxy'])
+			).resolves.toBeDefined();
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('HAPROXY'));
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json', '--waf', 'caddy'])
+			).resolves.toBeDefined();
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('CADDY'));
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'patch', 'report.json', '--waf', 'k8s'])
+			).resolves.toBeDefined();
+			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('K8S'));
 		});
 	});
 });
