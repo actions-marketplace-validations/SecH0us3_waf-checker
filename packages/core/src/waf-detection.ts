@@ -2,7 +2,7 @@
 // Based on response headers, behavior patterns, and timing analysis
 
 import { redactHeaders } from './utils/payload-utils';
-import { isValidTargetUrl } from './utils/security';
+import { isValidTargetUrl, isInScopeRedirect } from './utils/security';
 
 export interface WAFDetectionResult {
 	detected: boolean;
@@ -55,26 +55,55 @@ export class WAFDetector {
 			let confidence = 0;
 			const matchEvidence: string[] = [];
 
-			// Check headers
-			for (const [headerName, pattern] of Object.entries(signature.headers)) {
-				const headerValue = response.headers.get(headerName);
-				if (headerValue) {
-					// Cloudflare Workers inject cf-* and server: cloudflare headers into fetch responses
-					if (isWorker && signature.name === 'Cloudflare' && (headerName === 'server' || headerName.startsWith('cf-'))) {
-						continue;
-					}
-
-					if (typeof pattern === 'string') {
-						if (headerValue.toLowerCase().includes(pattern.toLowerCase())) {
-							confidence += 30;
-							const displayValue = redactHeaders({ [headerName]: headerValue })[headerName];
-							matchEvidence.push(`Header ${headerName}: ${displayValue}`);
+			// Check definitive headers (100% confidence match)
+			let hasDefinitiveMatch = false;
+			if (signature.definitiveHeaders) {
+				for (const [headerName, pattern] of Object.entries(signature.definitiveHeaders)) {
+					const headerValue = response.headers.get(headerName);
+					if (headerValue) {
+						// Cloudflare Workers inject cf-* and server: cloudflare headers into fetch responses
+						if (isWorker && signature.name === 'Cloudflare' && (headerName === 'server' || headerName.startsWith('cf-'))) {
+							continue;
 						}
-					} else if (pattern instanceof RegExp) {
-						if (pattern.test(headerValue)) {
-							confidence += 30;
+
+						const isMatch = typeof pattern === 'string'
+							? headerValue.toLowerCase().includes(pattern.toLowerCase())
+							: pattern.test(headerValue);
+
+						if (isMatch) {
+							hasDefinitiveMatch = true;
 							const displayValue = redactHeaders({ [headerName]: headerValue })[headerName];
-							matchEvidence.push(`Header ${headerName}: ${displayValue} (matches ${pattern})`);
+							matchEvidence.push(`Definitive header ${headerName}: ${displayValue} (100% confidence)`);
+							break;
+						}
+					}
+				}
+			}
+
+			if (hasDefinitiveMatch) {
+				confidence = 100;
+			} else {
+				// Check standard headers
+				for (const [headerName, pattern] of Object.entries(signature.headers)) {
+					const headerValue = response.headers.get(headerName);
+					if (headerValue) {
+						// Cloudflare Workers inject cf-* and server: cloudflare headers into fetch responses
+						if (isWorker && signature.name === 'Cloudflare' && (headerName === 'server' || headerName.startsWith('cf-'))) {
+							continue;
+						}
+
+						if (typeof pattern === 'string') {
+							if (headerValue.toLowerCase().includes(pattern.toLowerCase())) {
+								confidence += 30;
+								const displayValue = redactHeaders({ [headerName]: headerValue })[headerName];
+								matchEvidence.push(`Header ${headerName}: ${displayValue}`);
+							}
+						} else if (pattern instanceof RegExp) {
+							if (pattern.test(headerValue)) {
+								confidence += 30;
+								const displayValue = redactHeaders({ [headerName]: headerValue })[headerName];
+								matchEvidence.push(`Header ${headerName}: ${displayValue} (matches ${pattern})`);
+							}
 						}
 					}
 				}
@@ -82,7 +111,9 @@ export class WAFDetector {
 
 			// Check status codes
 			if (signature.statusCodes && signature.statusCodes.includes(response.status)) {
-				confidence += 20;
+				if (!hasDefinitiveMatch) {
+					confidence += 20;
+				}
 				matchEvidence.push(`Status code: ${response.status}`);
 			}
 
@@ -92,7 +123,9 @@ export class WAFDetector {
 				if (cookies) {
 					for (const pattern of signature.cookiePatterns) {
 						if (pattern.test(cookies)) {
-							confidence += 25;
+							if (!hasDefinitiveMatch) {
+								confidence += 25;
+							}
 							matchEvidence.push(`Cookie pattern match: ${pattern}`);
 						}
 					}
@@ -103,14 +136,16 @@ export class WAFDetector {
 			if (responseBody && signature.bodyPatterns) {
 				for (const pattern of signature.bodyPatterns) {
 					if (pattern.test(responseBody)) {
-						confidence += 25;
+						if (!hasDefinitiveMatch) {
+							confidence += 25;
+						}
 						matchEvidence.push(`Body pattern match: ${pattern}`);
 					}
 				}
 			}
 
 			// Check response time patterns (WAFs often add latency)
-			if (responseTime && responseTime > 500) {
+			if (!hasDefinitiveMatch && responseTime && responseTime > 500) {
 				confidence += 5;
 				// Don't add to evidence as it's circumstantial
 			}
@@ -143,6 +178,88 @@ export class WAFDetector {
 	}
 
 	/**
+	 * Probe a target URL with an optional attack payload and return detection result.
+	 */
+	private static async probeUrl(
+		targetUrl: string,
+		payload: string | undefined,
+		fetchFn: typeof fetch,
+		options?: { isWorker?: boolean; allowLocal?: boolean },
+	): Promise<WAFDetectionResult | null> {
+		let currentUrl = targetUrl;
+		if (payload !== undefined) {
+			const separator = targetUrl.includes('?') ? '&' : '?';
+			currentUrl = `${targetUrl}${separator}test=${encodeURIComponent(payload)}`;
+		}
+
+		try {
+			let redirectCount = 0;
+			const maxRedirects = 3;
+
+			while (true) {
+				const startTime = Date.now();
+				const controller = new AbortController();
+				const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+				let response: Response;
+				try {
+					response = await fetchFn(currentUrl, {
+						method: 'GET',
+						redirect: 'manual',
+						headers: {
+							'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+							'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+						},
+						signal: controller.signal,
+					});
+				} finally {
+					clearTimeout(timeoutId);
+				}
+				const responseTime = Date.now() - startTime;
+
+				let responseBody = '';
+				try {
+					const contentLength = response.headers?.get?.('content-length');
+					if (contentLength && parseInt(contentLength, 10) > 1048576) {
+						responseBody = '[Response Too Large]';
+					} else if (typeof response.text === 'function') {
+						responseBody = await response.text();
+					}
+				} catch {
+					responseBody = '';
+				}
+
+				const detection = await this.detectFromResponse(response, responseBody, responseTime, options?.isWorker);
+
+				// If definitive match or captcha detected on this response, return immediately
+				if (detection.detected || detection.captchaDetected) {
+					return detection;
+				}
+
+				// If redirect and we haven't exceeded max redirects, follow safely while verifying SSRF.
+				// Stay on the target's own domain: a redirect to an SSO provider or CDN would
+				// otherwise get that host's WAF reported as the target's.
+				if (response.status >= 300 && response.status < 400 && redirectCount < maxRedirects) {
+					const location = response.headers?.get?.('location');
+					if (location) {
+						const nextUrl = new URL(location, currentUrl).toString();
+						if (isValidTargetUrl(nextUrl, { allowLocal: options?.allowLocal }) && isInScopeRedirect(currentUrl, nextUrl)) {
+							currentUrl = nextUrl;
+							redirectCount++;
+							continue;
+						}
+					}
+				}
+
+				return detection.detected || detection.captchaDetected ? detection : null;
+			}
+		} catch (error) {
+			console.error('Active detection probe failed:', error);
+			return null;
+		}
+	}
+
+	/**
 	 * Perform active WAF detection by sending probe requests
 	 */
 	static async activeDetection(url: string, options?: { fetch?: typeof fetch; isWorker?: boolean; allowLocal?: boolean }): Promise<WAFDetectionResult> {
@@ -152,48 +269,28 @@ export class WAFDetector {
 		const fetchFn = options?.fetch || globalThis.fetch;
 		const probePayloads = ["' OR '1'='1", '<script>alert(1)</script>', '../../../etc/passwd', 'UNION SELECT 1,2,3--'];
 
-		const probePromises = probePayloads.map(async (payload) => {
-			try {
-				const separator = url.includes('?') ? '&' : '?';
-				const startTime = Date.now();
-				const controller = new AbortController();
-				const timeoutId = setTimeout(() => controller.abort(), 10000);
+		// 1. Send clean baseline probe first to inspect standard headers and cookies.
+		// If a definitive match (100% confidence) is found, return immediately without triggering attack alarms.
+		const baselineResult = await this.probeUrl(url, undefined, fetchFn, options);
+		if (baselineResult && baselineResult.confidence === 100) {
+			return baselineResult;
+		}
 
-				let response;
-				try {
-					response = await fetchFn(`${url}${separator}test=${encodeURIComponent(payload)}`, {
-						method: 'GET',
-						redirect: 'manual',
-						signal: controller.signal,
-					});
-				} finally {
-					clearTimeout(timeoutId);
-				}
-				const responseTime = Date.now() - startTime;
+		// 2. Run attack payload probes and Cloudflare /cdn-cgi edge probe in parallel.
+		const probePromises = probePayloads.map((payload) => this.probeUrl(url, payload, fetchFn, options));
 
-				let responseBody = '';
-				const contentLength = response.headers.get('content-length');
-				if (contentLength && parseInt(contentLength, 10) > 1048576) {
-					responseBody = '[Response Too Large]';
-				} else {
-					responseBody = await response.text();
-				}
-
-				const detection = await this.detectFromResponse(response, responseBody, responseTime, options?.isWorker);
-				return detection.detected || detection.captchaDetected ? detection : null;
-			} catch (error) {
-				console.error('Active detection probe failed:', error);
-				return null;
-			}
-		});
-
-		// Run the payload probes and the Cloudflare /cdn-cgi edge probe in parallel.
 		const [payloadResults, cdnCgiResult] = await Promise.all([
 			Promise.all(probePromises),
 			this.detectViaCdnCgi(url, fetchFn, options?.isWorker),
 		]);
 
-		const results = payloadResults.filter((r): r is WAFDetectionResult => r !== null);
+		const results: WAFDetectionResult[] = [];
+		if (baselineResult) {
+			results.push(baselineResult);
+		}
+		for (const r of payloadResults) {
+			if (r) results.push(r);
+		}
 		if (cdnCgiResult) {
 			results.push(cdnCgiResult);
 		}
@@ -309,6 +406,13 @@ export class WAFDetector {
 				'Content-Type manipulation',
 			],
 			'DDoS-Guard': [
+				'HTTP parameter pollution',
+				'Double URL encoding',
+				'Request rate pacing',
+				'Header case manipulation',
+				'Alternative whitespace characters',
+			],
+			'Qrator WAF': [
 				'HTTP parameter pollution',
 				'Double URL encoding',
 				'Request rate pacing',
