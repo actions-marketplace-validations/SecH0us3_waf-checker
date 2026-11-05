@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { sendRequest, handleApiCheckFiltered } from '../src/check';
+import { sendRequest, handleApiCheckFiltered, handleApiCheckWithEnvelope, MAX_REDIRECTS } from '../src/check';
 
 describe('check.ts', () => {
 	it('should send a basic request', async () => {
@@ -304,14 +304,12 @@ describe('check.ts', () => {
 				return Promise.resolve({
 					status: 301,
 					headers: new Headers({ location: 'https://www.example.com/.env' }),
-					clone: () => ({ text: async () => '' }),
 					text: async () => '',
 				});
 			}
 			return Promise.resolve({
 				status: 200,
 				headers: new Headers(),
-				clone: () => ({ text: async () => 'DB_PASSWORD=hunter2' }),
 				text: async () => 'DB_PASSWORD=hunter2',
 			});
 		});
@@ -340,7 +338,6 @@ describe('check.ts', () => {
 			return Promise.resolve({
 				status: 302,
 				headers: new Headers({ location: 'https://cdn.othervendor.net/.env' }),
-				clone: () => ({ text: async () => '' }),
 				text: async () => '',
 			});
 		});
@@ -499,5 +496,134 @@ describe('check.ts', () => {
 
 		expect(results.length).toBeGreaterThan(0);
 		expect(results.some(r => r.wafDetected)).toBe(true);
+	});
+});
+
+describe('sendRequest time and connection bounds', () => {
+	it('ends a response body that never finishes at the request timeout', async () => {
+		vi.useFakeTimers();
+		try {
+			// Headers arrive at once, the body never completes until the request is aborted.
+			const mockFetch = vi.fn().mockImplementation(async (_url: string, options: any) => {
+				const signal: AbortSignal = options.signal;
+				const never = () => new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted'))));
+				return { status: 200, headers: new Headers(), text: never };
+			});
+
+			const pending = sendRequest('http://example.com/api', 'GET', undefined, undefined, undefined, false, false, undefined, undefined, {
+				fetch: mockFetch as any,
+				quiet: true,
+			});
+			await vi.advanceTimersByTimeAsync(10_000);
+			const result = await pending;
+
+			expect(result.status).toBe(200);
+			expect(result.bodyText).toBe('');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it.each([
+		{ description: 'single redirect hop', hops: 1 },
+		{ description: `maximum allowed chain (MAX_REDIRECTS = ${MAX_REDIRECTS})`, hops: MAX_REDIRECTS },
+	])('releases all hops before following them across $description', async ({ hops }) => {
+		const cancel = vi.fn().mockResolvedValue(undefined);
+		const mockFetch = vi.fn();
+		for (let i = 1; i <= hops; i++) {
+			mockFetch.mockResolvedValueOnce({
+				status: 302,
+				headers: new Headers({ Location: `http://example.com/step-${i}` }),
+				body: { cancel },
+			});
+		}
+		mockFetch.mockResolvedValueOnce({
+			status: 200,
+			headers: new Headers(),
+			text: () => Promise.resolve('reached final target'),
+		});
+
+		const result = await sendRequest('http://example.com/step-0', 'GET', undefined, undefined, undefined, true, false, undefined, undefined, {
+			fetch: mockFetch as any,
+			quiet: true,
+		});
+
+		expect(result.status).toBe(200);
+		expect(result.bodyText).toBe('reached final target');
+		expect(cancel).toHaveBeenCalledTimes(hops);
+		expect(mockFetch).toHaveBeenCalledTimes(hops + 1);
+	});
+
+	it('stops following redirects when exceeding MAX_REDIRECTS without infinite looping', async () => {
+		const cancel = vi.fn().mockResolvedValue(undefined);
+		let hop = 0;
+		const mockFetch = vi.fn().mockImplementation(() => {
+			hop++;
+			return Promise.resolve({
+				status: 302,
+				headers: new Headers({ Location: `http://example.com/loop-${hop}` }),
+				body: { cancel },
+				text: () => Promise.resolve('looping redirect'),
+			});
+		});
+
+		const result = await sendRequest('http://example.com/loop-0', 'GET', undefined, undefined, undefined, true, false, undefined, undefined, {
+			fetch: mockFetch as any,
+			quiet: true,
+		});
+
+		// The initial request plus MAX_REDIRECTS followed hops, then the loop stops.
+		expect(mockFetch).toHaveBeenCalledTimes(MAX_REDIRECTS + 1);
+		// cancel() runs on each followed hop; the final un-followed 302 is not released.
+		expect(cancel).toHaveBeenCalledTimes(MAX_REDIRECTS);
+		// Final result is the un-followed 302.
+		expect(result.status).toBe(302);
+		expect(result.is_redirect).toBe(true);
+	});
+});
+
+describe('paged ParamCheck scans', () => {
+	// Variation counts are cached across pages and variations are only generated
+	// for the page being scanned, so paging must still visit exactly the items a
+	// single page covering the whole scan does, in the same order.
+	const scanAll = async (pageSize: number, caseSensitive: boolean) => {
+		const fetch = vi.fn().mockResolvedValue({ status: 403, headers: new Headers() });
+		const items: string[] = [];
+		let total = -1;
+		for (let page = 0; ; page++) {
+			const env = await handleApiCheckWithEnvelope(
+				'http://example.com/api',
+				page,
+				['GET', 'POST'],
+				['SQL Injection', 'XSS', 'Path Traversal'],
+				undefined,
+				false,
+				undefined,
+				false,
+				caseSensitive,
+				false,
+				false,
+				false,
+				true,
+				'modsecurity',
+				undefined,
+				{ fetch: fetch as any, quiet: true, pageSize },
+			);
+			if (total === -1) total = env.total;
+			expect(env.total).toBe(total);
+			items.push(...env.results.map((r) => `${r.category}|${r.method}|${r.payload}|${(r as any).originalPayload}`));
+			if (!env.hasMore) break;
+		}
+		return { items, total };
+	};
+
+	it.each([false, true])('covers the same items as one big page (caseSensitive=%s)', async (caseSensitive) => {
+		const whole = await scanAll(100_000, caseSensitive);
+		expect(whole.items.length).toBe(whole.total);
+		for (const pageSize of [7, 50]) {
+			const paged = await scanAll(pageSize, caseSensitive);
+			expect(paged.total).toBe(whole.total);
+			expect(paged.items).toEqual(whole.items);
+		}
 	});
 });

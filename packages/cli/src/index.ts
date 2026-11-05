@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { fetch as undiciFetch, ProxyAgent } from 'undici';
+import { createRequire } from 'node:module';
+import { lookup as dnsLookup } from 'node:dns';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
 	WAFDetector,
 	handleApiCheckFiltered,
 	isValidTargetUrl,
+	isValidOriginIp,
 	redactUrl,
 	PAYLOADS,
 	runReverseEngineeringAudit,
@@ -16,10 +18,24 @@ import {
 	PatchVendor,
 	PatchTier,
 	PatchAction,
+	diffScans,
+	parseStoredReport,
+	ScanDiff,
 } from '@waf-checker/core';
 import { writeReport, deduceFormat, ReportFormat } from './report';
 
 let useColor = true;
+
+// Resolve the CLI version from the package.json shipped alongside dist/ at
+// runtime (npm always includes package.json in the published package), so
+// `--version` never drifts from the real release. Falls back if unreadable.
+function resolveVersion(): string {
+	try {
+		return JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || '0.0.0';
+	} catch {
+		return '0.0.0';
+	}
+}
 
 const colors = {
 	green: (text: string) => useColor ? `\x1b[32m${text}\x1b[0m` : text,
@@ -59,7 +75,7 @@ const program = new Command();
 program
 	.name('waf-checker')
 	.description('Automated WAF (Web Application Firewall) Security Auditing & Fingerprinting Tool')
-	.version('1.3.0')
+	.version(resolveVersion())
 	.showHelpAfterError()
 	.option('--no-color', 'Disable colored output')
 	.addHelpText('after', detailedHelp);
@@ -71,11 +87,83 @@ program.hook('preAction', () => {
 	}
 });
 
-// Helper to get custom fetch with proxy support
-function getFetch(proxyUrl?: string): typeof fetch {
-	if (proxyUrl) {
-		const agent = new ProxyAgent(proxyUrl);
-		return ((url: any, init: any) => undiciFetch(url, { ...init, dispatcher: agent })) as any;
+// Normalize an origin IP to a bare literal: isValidOriginIp accepts IPv6 in
+// bracketed (`[::1]`) or unbracketed form, but net/undici dial a bare address —
+// a bracketed string is not a valid connect address. Single normalization point
+// so the connector and core (cf.resolveOverride) never diverge on bracket rules.
+export function normalizeOriginIp(ip: string): string {
+	const t = ip.trim();
+	return t.startsWith('[') && t.endsWith(']') ? t.slice(1, -1) : t;
+}
+
+// Origin-IP bypass test: force the TARGET hostname to resolve to a known origin
+// IP behind the WAF. Node/undici has no Cloudflare `cf.resolveOverride`, so we
+// override DNS at the connector with a custom lookup. The URL — and therefore
+// the Host header and TLS SNI — stay on the domain; only the dialed address
+// changes. This is the `curl --resolve host:port:ip` behaviour.
+//
+// Only the target host is pinned to the IP; any other host (e.g. a redirect to a
+// sibling subdomain when --follow-redirects is on) resolves normally, so we never
+// misreport another vhost's response as served from this origin. `ip` must be a
+// bare literal (see normalizeOriginIp); `realLookup` is injectable for tests.
+export function originIpLookup(ip: string, targetHost: string, realLookup: typeof dnsLookup = dnsLookup) {
+	const family = ip.includes(':') ? 6 : 4;
+	const target = targetHost.toLowerCase();
+	return (hostname: string, options: any, callback: any) => {
+		if (String(hostname).toLowerCase() !== target) {
+			return realLookup(hostname, options, callback);
+		}
+		if (options && options.all) {
+			callback(null, [{ address: ip, family }]);
+		} else {
+			callback(null, ip, family);
+		}
+	};
+}
+
+export interface FetchOptions {
+	proxy?: string;
+	/** Bare origin IP literal (see normalizeOriginIp); requires targetHost. */
+	originIp?: string;
+	/** Hostname the origin-IP override is scoped to. */
+	targetHost?: string;
+	/** Skip TLS certificate verification (curl -k). Dangerous; opt-in only. */
+	insecure?: boolean;
+}
+
+// undici is only needed for a custom dispatcher (--proxy, --origin-ip,
+// --insecure), and importing it costs ~100 ms — most of the CLI's startup, paid
+// by every run including --help, --version and shell completion. Load it
+// synchronously on first use instead, so getFetch behaves exactly as before.
+const nodeRequire = createRequire(import.meta.url);
+let undiciModule: typeof import('undici') | undefined;
+function undici(): typeof import('undici') {
+	return (undiciModule ??= nodeRequire('undici') as typeof import('undici'));
+}
+
+// Helper to get a custom fetch with proxy, origin-IP override and/or insecure-TLS
+// support. All connector tweaks compose onto the same undici dispatcher so they
+// can be combined (e.g. --origin-ip together with --insecure).
+export function getFetch(opts: FetchOptions = {}): typeof fetch {
+	const { proxy, originIp, targetHost, insecure } = opts;
+	const bind = (dispatcher: any): typeof fetch => {
+		const undiciFetch = undici().fetch;
+		return ((url: any, init: any) => undiciFetch(url, { ...init, dispatcher })) as any;
+	};
+	// Single source of truth for the insecure-TLS decision, applied to whichever
+	// dispatcher we build below (undici uses `requestTls` for a proxy's end-server
+	// TLS and `connect` for a direct connection).
+	const tlsOpts = insecure ? { rejectUnauthorized: false } : undefined;
+
+	if (proxy) {
+		return bind(new (undici().ProxyAgent)(tlsOpts ? { uri: proxy, requestTls: tlsOpts } : proxy));
+	}
+
+	const connect: Record<string, any> = { ...(tlsOpts ?? {}) };
+	if (originIp && targetHost) connect.lookup = originIpLookup(originIp, targetHost);
+
+	if (Object.keys(connect).length > 0) {
+		return bind(new (undici().Agent)({ connect }));
 	}
 	return globalThis.fetch;
 }
@@ -112,6 +200,66 @@ function parseThreshold(val: string): number {
 	return minThreshold;
 }
 
+const STATUS_LABEL: Record<string, string> = {
+	blocked: 'BLOCKED',
+	exposed: 'EXPOSED',
+	passed: 'passed',
+	inconclusive: 'inconclusive',
+};
+
+function statusTransition(from?: string, to?: string): string {
+	return `${from ? STATUS_LABEL[from] ?? from : '—'} → ${to ? STATUS_LABEL[to] ?? to : '—'}`;
+}
+
+/**
+ * Load a previous JSON report and print a regression/improvement diff against
+ * the current results. Returns the computed diff so the caller can set the
+ * process exit code. Returns null if the report could not be read/parsed.
+ */
+function runScanDiff(comparePath: string, current: any[]): ScanDiff | null {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(comparePath, 'utf8');
+	} catch (err: any) {
+		console.error(colors.red(`Error reading --compare report "${comparePath}": ${err.message}`));
+		return null;
+	}
+	let previous;
+	try {
+		previous = parseStoredReport(raw);
+	} catch (err: any) {
+		console.error(colors.red(err.message));
+		return null;
+	}
+
+	const diff = diffScans(previous, current);
+	console.log();
+	console.log(colors.cyan('🔀 Scan Diff (vs previous report)'));
+	console.log(
+		`  ${colors.red(`Regressions: ${diff.regressions.length}`)}  ·  ` +
+			`${colors.green(`Improvements: ${diff.improvements.length}`)}  ·  ` +
+			`Added: ${diff.added.length}  ·  Removed: ${diff.removed.length}  ·  Unchanged: ${diff.unchanged}`,
+	);
+
+	if (diff.regressions.length > 0) {
+		console.log(colors.red('\n  ⚠️  New bypasses (previously blocked, now NOT blocked):'));
+		for (const r of diff.regressions) {
+			const tech = r.bypassTechnique ? ` [${r.bypassTechnique}]` : '';
+			console.log(
+				colors.red(`    • ${r.category} (${r.method})${tech}: ${statusTransition(r.from, r.to)}  payload: ${r.payload}`),
+			);
+		}
+	}
+	if (diff.improvements.length > 0) {
+		console.log(colors.green('\n  ✅ Newly blocked (previously got through):'));
+		for (const i of diff.improvements) {
+			const tech = i.bypassTechnique ? ` [${i.bypassTechnique}]` : '';
+			console.log(colors.green(`    • ${i.category} (${i.method})${tech}: ${statusTransition(i.from, i.to)}`));
+		}
+	}
+	return diff;
+}
+
 // Command: detect
 program
 	.command('detect <url>')
@@ -125,7 +273,7 @@ program
 				process.exit(1);
 			}
 
-			const customFetch = getFetch(options.proxy);
+			const customFetch = getFetch({ proxy: options.proxy });
 			const detection = await WAFDetector.activeDetection(url, { fetch: customFetch });
 
 			if (options.json) {
@@ -178,6 +326,9 @@ checkCmd
 	.option('--http-manipulation', 'Run HTTP manipulation tests (Verb Tampering, Parameter Pollution, etc.)', false)
 	.option('--padding <size>', 'Enable WAF inspection buffer padding evasion (e.g. 8kb, 16kb, 64kb, 128kb)')
 	.option('--no-spoof-user-agent', 'Disable the legitimate User-Agent bypass test (replays blocked 403 requests as Googlebot, Slackbot, etc.)')
+	.option('--no-spoof-ip', 'Disable the trusted IP header bypass test (replays blocked 403/406 requests with X-Forwarded-For, X-Real-IP, True-Client-IP, etc.)')
+	.option('--no-calibrate-baseline', 'Disable baseline calibration before scanning')
+	.option('--concurrency <number>', 'Number of concurrent payload requests', '5')
 	.option('--json', 'Output results in JSON format')
 	.option('-f, --format <format>', 'Output format for report: json, csv, html, sarif, markdown, junit')
 	.option('-o, --output <path>', 'File path to save the report to')
@@ -196,7 +347,13 @@ checkCmd
 	.option('-q, --quiet', 'Suppress per-request logging, displaying only final results')
 	.option('--silent', 'Alias for --quiet')
 	.option('--fail-on-bypass', 'Exit with exit code 1 if any bypasses are detected', false)
+	.option('--compare <path>', 'Compare against a previous JSON report and show regressions/improvements (scan diff)')
+	.option('--fail-on-regression', 'Exit with exit code 1 if any payload blocked in the --compare report is no longer blocked', false)
 	.option('--allow-local', 'Allow testing localhost, 127.0.0.1, and private IP ranges (Docker/LAN)', false)
+	.option('--origin-ip <ip>', 'Resolve the target hostname to this known origin IP behind the WAF (Host header and TLS stay on the domain) to test whether the origin is reachable directly, past the WAF. Public IP only; not compatible with --proxy')
+	.option('-k, --insecure', 'Skip TLS certificate verification (like curl -k). Dangerous — disables protection against MITM; use only for trusted targets (e.g. with --origin-ip where the origin cert will not match the domain)', false)
+	.option('--limit <number>', 'Limit the scan to at most N payload tests = N requests (one per test; +hops if --follow-redirects), e.g. --limit 1 for a single request. Disables baseline calibration and the UA/IP bypass probe replays to keep the count exact, which makes the protection score approximate — avoid combining with --threshold. Does not bound --auto-detect-waf/--reverse, which probe separately. Alias: --max-requests')
+	.option('--max-requests <number>', 'Alias for --limit')
 	.addHelpText('after', detailedHelp)
 	.action(async (url: string, options: any) => {
 		const isQuiet = options.quiet || options.silent;
@@ -207,7 +364,50 @@ checkCmd
 				process.exit(1);
 			}
 
-			const customFetch = getFetch(options.proxy);
+			let originIp = options.originIp ? String(options.originIp).trim() : undefined;
+			if (originIp) {
+				if (!isValidOriginIp(originIp)) {
+					console.error(colors.red(`Error: --origin-ip "${originIp}" is not a valid public IP (private, loopback, link-local and reserved ranges are rejected).`));
+					process.exit(1);
+				}
+				if (options.proxy) {
+					console.error(colors.red('Error: --origin-ip cannot be combined with --proxy (the proxy performs its own DNS resolution).'));
+					process.exit(1);
+				}
+				// Normalize to a bare literal so the connector (and core) dial it correctly.
+				originIp = normalizeOriginIp(originIp);
+			}
+
+			// Request limit: cap the number of payload tests executed (page 0 holds the
+			// whole plan otherwise). --max-requests is an alias for --limit.
+			const limitRaw = options.limit ?? options.maxRequests;
+			let requestLimit: number | undefined = undefined;
+			if (limitRaw !== undefined) {
+				const s = String(limitRaw).trim();
+				const n = Number(s);
+				if (!/^\d+$/.test(s) || !Number.isInteger(n) || n < 1) {
+					console.error(colors.red(`Error: --limit/--max-requests must be a positive integer (received: ${limitRaw}).`));
+					process.exit(1);
+				}
+				requestLimit = n;
+			}
+
+			if (options.insecure && !isQuiet) {
+				console.error(colors.yellow('⚠️  --insecure: TLS certificate verification is DISABLED for this scan.'));
+			}
+			if (requestLimit !== undefined && !isQuiet) {
+				console.error(colors.dim(`[i] --limit ${requestLimit}: baseline calibration and UA/IP bypass probe replays disabled so the scan issues exactly ${requestLimit} request(s) (plus redirect hops if --follow-redirects).`));
+				if (options.autoDetectWaf || options.reverse || options.reverseEngineer) {
+					console.error(colors.dim('[i] note: --auto-detect-waf / --reverse perform their own probing that is not counted against --limit.'));
+				}
+				if (options.threshold !== undefined) {
+					console.error(colors.yellow('⚠️  --limit disables baseline calibration, so the protection score is approximate; --threshold gating on a limited run is unreliable.'));
+				}
+			}
+
+			// Scope the DNS override to the target host only.
+			const targetHost = originIp ? new URL(url.replace(/\{PAYLOAD\}/g, 'test-payload')).hostname : undefined;
+			const customFetch = getFetch({ proxy: options.proxy, originIp, targetHost, insecure: Boolean(options.insecure) });
 			const methods = parseCommaList(options.methods) || ['GET'];
 			const categories = parseCommaList(options.categories);
 			const headers = parseCustomHeaders(options.customHeaders);
@@ -221,6 +421,8 @@ checkCmd
 				enableInspectionLimitPadding: enablePadding,
 				paddingSize: options.padding || '16kb',
 			} : undefined;
+
+			const concurrency = Math.max(1, parseInt(options.concurrency, 10) || 5);
 
 			const results = await handleApiCheckFiltered(
 				url,
@@ -238,7 +440,24 @@ checkCmd
 				options.encodingVariations,
 				options.detectedWaf,
 				httpManipulationOpts,
-				{ fetch: customFetch, color: useColor, quiet: isQuiet, allowLocal, spoofUserAgents: options.spoofUserAgent !== false, pageSize: ALL_PAYLOADS_PAGE_SIZE }
+				{
+					fetch: customFetch,
+					color: useColor,
+					quiet: isQuiet,
+					allowLocal,
+					// Under a request limit, suppress every extra request so the count is
+					// exactly N (one per payload test): the UA/IP bypass probe replays (an
+					// unbounded per-blocked-item fan-out) and the one baseline calibration
+					// request. Dropping baseline means origin-side 403/406s can be miscounted
+					// as WAF blocks, so the protection score is approximate under --limit —
+					// surfaced by the --threshold warning above, not silently.
+					spoofUserAgents: requestLimit === undefined && options.spoofUserAgent !== false,
+					spoofIpHeaders: requestLimit === undefined && options.spoofIp !== false,
+					calibrateBaseline: requestLimit === undefined && options.calibrateBaseline !== false,
+					concurrency,
+					pageSize: requestLimit ?? ALL_PAYLOADS_PAGE_SIZE,
+					originIpOverride: originIp,
+				}
 			);
 
 			let reverseReport: ReverseEngineeringReport | undefined = undefined;
@@ -291,20 +510,23 @@ checkCmd
 			console.log(`\n=== WAF Audit Results for ${colors.cyan(url)} ===`);
 			console.log(`Total tests executed: ${results.length}`);
 
-			const blocked = results.filter((r: any) => r.status === 403 || r.status === 'BLOCKED');
-			const bypassed = results.filter((r: any) => r.status === 200 || r.status === '200');
+			const blocked = results.filter((r: any) => (r.status === 403 || r.status === 'BLOCKED' || r.blocked === true) && r.baselineNote !== 'origin_blocked');
+			const bypassed = results.filter((r: any) => (r.status === 200 || r.status === '200') && r.blocked !== true);
+			const originBlocked = results.filter((r: any) => r.baselineNote === 'origin_blocked');
 			const redirect = results.filter((r: any) => r.is_redirect);
 			const errors = results.filter((r: any) => r.status === 'ERR');
-			// Legitimate User-Agent bypasses: blocked (403) with a normal UA, but let
-			// through once the request claimed to be a trusted bot. Tracked separately
-			// from `bypassed` (their status is 403) so protectionScore stays honest,
-			// but they still fail CI checks below.
+			// Legitimate User-Agent & Trusted IP Header bypasses: blocked (403) normally,
+			// but let through once the request claimed to be a trusted bot or spoofed
+			// proxy IP headers. Tracked separately from `bypassed` so protectionScore
+			// stays honest, but they still fail CI checks below.
 			const uaBypasses = results.filter((r: any) => r.userAgentBypass?.bypassed);
+			const ipBypasses = results.filter((r: any) => r.ipHeaderBypass?.bypassed);
 
 			const protectionScore = results.length ? Math.round((blocked.length / results.length) * 100) : 100;
 
 			console.log(`  🛡️ Blocked:   ${colors.green(`${blocked.length} (${protectionScore}%)`)}`);
 			console.log(`  🔓 Bypassed:  ${bypassed.length > 0 ? colors.red(`${bypassed.length} (${results.length ? Math.round(bypassed.length / results.length * 100) : 0}%)`) : colors.green('0 (0%)')}`);
+			if (originBlocked.length > 0) console.log(`  ⚠️ Origin 403: ${colors.yellow(`${originBlocked.length} (matches benign baseline 403/406)`)}`);
 			if (redirect.length > 0) console.log(`  🔄 Redirects: ${colors.yellow(String(redirect.length))}`);
 			if (errors.length > 0) console.log(`  ⚠️ Errors:    ${colors.red(String(errors.length))}`);
 
@@ -325,7 +547,7 @@ checkCmd
 					console.log(`... and ${colors.yellow(String(bypassed.length - 50))} more bypasses.`);
 				}
 				console.log('--------------------------------------------------------------------------------');
-			} else if (uaBypasses.length === 0) {
+			} else if (uaBypasses.length === 0 && ipBypasses.length === 0) {
 				console.log(`\n${colors.green('🛡️ Perfect Score: All attack vectors were successfully blocked.')}`);
 			}
 
@@ -344,6 +566,25 @@ checkCmd
 				});
 				if (uaBypasses.length > 50) {
 					console.log(`  ... and ${colors.yellow(String(uaBypasses.length - 50))} more User-Agent bypasses.`);
+				}
+				console.log('--------------------------------------------------------------------------------');
+			}
+
+			// Trusted IP Header bypasses: requests blocked normally that sailed through
+			// when spoofing X-Forwarded-For, X-Real-IP, True-Client-IP, etc.
+			if (ipBypasses.length > 0) {
+				console.log(`\n${colors.red('🌐 TRUSTED IP HEADER ALLOW-LIST BYPASSES DETECTED:')}`);
+				console.log(colors.yellow('   (blocked normally, but let through when spoofing proxy/forwarding headers)'));
+				console.log('--------------------------------------------------------------------------------');
+				ipBypasses.slice(0, 50).forEach((r: any) => {
+					const headersList = r.ipHeaderBypass.hits.map((h: any) => `${h.header}: ${h.value}`).join(', ');
+					const cat = colors.cyan(r.category);
+					const pay = colors.bold(String(r.payload).substring(0, 50));
+					console.log(`  • ${cat} [${r.method}] ${colors.green('403')} ${colors.red('→ bypassed')} via ${colors.red(headersList)}`);
+					console.log(`      payload: ${pay}`);
+				});
+				if (ipBypasses.length > 50) {
+					console.log(`  ... and ${colors.yellow(String(ipBypasses.length - 50))} more Trusted IP header bypasses.`);
 				}
 				console.log('--------------------------------------------------------------------------------');
 			}
@@ -405,24 +646,45 @@ checkCmd
 				}
 			}
 
+			let scanDiff: ScanDiff | null = null;
+			if (options.compare) {
+				scanDiff = runScanDiff(options.compare, results);
+				if (scanDiff === null && options.failOnRegression) {
+					// Could not load the baseline report but the gate was requested.
+					process.exit(1);
+				}
+			}
+
 			if (options.threshold !== undefined) {
 				const minThreshold = parseThreshold(options.threshold);
 				if (protectionScore < minThreshold) {
 					console.error(colors.red(`CI/CD Threshold Failed: Protection score ${protectionScore}% is below required threshold of ${minThreshold}%.`));
 					process.exit(1);
 				}
-				// A User-Agent allow-list bypass defeats the WAF regardless of score.
+				// A User-Agent or Trusted IP allow-list bypass defeats the WAF regardless of score.
 				if (uaBypasses.length > 0) {
 					console.error(colors.red(`CI/CD Threshold Failed: ${uaBypasses.length} User-Agent allow-list bypass(es) detected.`));
 					process.exit(1);
 				}
+				if (ipBypasses.length > 0) {
+					console.error(colors.red(`CI/CD Threshold Failed: ${ipBypasses.length} Trusted IP header allow-list bypass(es) detected.`));
+					process.exit(1);
+				}
 			}
 
-			if (options.failOnBypass && (bypassed.length > 0 || uaBypasses.length > 0)) {
+			if (options.failOnBypass && (bypassed.length > 0 || uaBypasses.length > 0 || ipBypasses.length > 0)) {
 				const parts = [];
 				if (bypassed.length > 0) parts.push(`${bypassed.length} bypass(es)`);
 				if (uaBypasses.length > 0) parts.push(`${uaBypasses.length} User-Agent allow-list bypass(es)`);
+				if (ipBypasses.length > 0) parts.push(`${ipBypasses.length} Trusted IP header allow-list bypass(es)`);
 				console.error(colors.red(`CI/CD Check Failed: ${parts.join(' and ')} detected.`));
+				process.exit(1);
+			}
+
+			if (options.failOnRegression && scanDiff && scanDiff.hasRegressions) {
+				console.error(
+					colors.red(`CI/CD Regression Failed: ${scanDiff.regressions.length} payload(s) blocked in the previous report are no longer blocked.`),
+				);
 				process.exit(1);
 			}
 		} catch (err: any) {
@@ -487,7 +749,7 @@ batchCmd
 				process.exit(1);
 			}
 
-			const customFetch = getFetch(options.proxy);
+			const customFetch = getFetch({ proxy: options.proxy });
 			const concurrency = parseInt(options.concurrency, 10) || 3;
 			const methods = parseCommaList(options.methods) || ['GET'];
 			const categories = parseCommaList(options.categories);
@@ -793,6 +1055,164 @@ program
 		for (const c of categories) {
 			console.log(`  - ${c.name} ${colors.dim(`[${c.type}, ${c.payloads} payloads]`)}`);
 		}
+	});
+
+// ---------------------------------------------------------------------------
+// Shell completion
+//
+// Generated from the live commander metadata so the completions never drift
+// from the actual commands/flags. `completion [bash|zsh|fish]` prints a script
+// to eval/source; with no argument the current $SHELL is auto-detected.
+// ---------------------------------------------------------------------------
+
+export const COMPLETION_SHELLS = ['bash', 'zsh', 'fish'] as const;
+export type CompletionShell = (typeof COMPLETION_SHELLS)[number];
+
+interface CommandMeta {
+	name: string;
+	description: string;
+	options: string[]; // long flags, e.g. "--insecure"
+}
+
+/** Collect top-level subcommands and their long option flags from the program. */
+export function collectCommandMeta(prog: Command = program): { commands: CommandMeta[]; globalOptions: string[] } {
+	const commands: CommandMeta[] = (prog.commands as any[])
+		.filter((c) => c.name() && c.name() !== 'help')
+		.map((c) => {
+			const options = [
+				...new Set([...(c.options || []).map((o: any) => o.long).filter(Boolean), '--help']),
+			] as string[];
+			return { name: c.name(), description: (c.description?.() || '').split('\n')[0], options };
+		});
+	// commander already stores --version in prog.options when .version() is set,
+	// so dedupe to avoid offering it twice.
+	const globalOptions = [
+		...new Set([...(prog.options || []).map((o: any) => o.long).filter(Boolean), '--help', '--version']),
+	] as string[];
+	return { commands, globalOptions };
+}
+
+/**
+ * Escape a string for embedding inside a fish single-quoted literal. Fish only
+ * treats `\\` and `\'` as escapes inside single quotes, so backslashes must be
+ * escaped BEFORE quotes (escaping quotes first would leave the introduced
+ * backslashes unescaped — incomplete sanitization).
+ */
+export function fishSingleQuoteEscape(s: string): string {
+	return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+export function generateCompletion(shell: CompletionShell, prog: Command = program): string {
+	const { commands, globalOptions } = collectCommandMeta(prog);
+	const names = commands.map((c) => c.name);
+
+	if (shell === 'bash') {
+		const perCmd = commands
+			.map((c) => `        ${c.name}) opts="${c.options.join(' ')}" ;;`)
+			.join('\n');
+		return `# waf-checker bash completion. Add to your shell:
+#   waf-checker completion bash > /etc/bash_completion.d/waf-checker   # system-wide
+#   # or: echo 'source <(waf-checker completion bash)' >> ~/.bashrc
+_waf_checker() {
+    local cur cmd i
+    cur="\${COMP_WORDS[COMP_CWORD]}"
+    local commands="${names.join(' ')}"
+    cmd=""
+    for ((i=1; i<COMP_CWORD; i++)); do
+        case "\${COMP_WORDS[i]}" in
+            -*) ;;
+            *) cmd="\${COMP_WORDS[i]}"; break ;;
+        esac
+    done
+    if [ -z "$cmd" ]; then
+        COMPREPLY=( $(compgen -W "$commands ${globalOptions.join(' ')}" -- "$cur") )
+        return
+    fi
+    local opts=""
+    case "$cmd" in
+${perCmd}
+    esac
+    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+}
+complete -F _waf_checker waf-checker
+`;
+	}
+
+	if (shell === 'zsh') {
+		const perCmd = commands
+			.map((c) => `            ${c.name}) compadd -- ${c.options.join(' ')} ;;`)
+			.join('\n');
+		return `#compdef waf-checker
+# waf-checker zsh completion. Add to your shell:
+#   waf-checker completion zsh > "\${fpath[1]}/_waf-checker"   # into an fpath dir
+#   # or: echo 'source <(waf-checker completion zsh)' >> ~/.zshrc
+_waf_checker() {
+    local -a commands
+    commands=(${names.join(' ')})
+    local cmd="" i
+    # Find the subcommand, skipping any leading global flags (e.g. --no-color).
+    for (( i=2; i < CURRENT; i++ )); do
+        case "\${words[i]}" in
+            -*) ;;
+            *) cmd="\${words[i]}"; break ;;
+        esac
+    done
+    if [[ -z $cmd ]]; then
+        compadd -- $commands ${globalOptions.join(' ')}
+        return
+    fi
+    case "$cmd" in
+${perCmd}
+    esac
+}
+compdef _waf_checker waf-checker
+`;
+	}
+
+	// fish
+	const lines: string[] = [
+		'# waf-checker fish completion. Add to your shell:',
+		'#   waf-checker completion fish > ~/.config/fish/completions/waf-checker.fish',
+		'complete -c waf-checker -f',
+	];
+	// Global options, offered before a subcommand is given (mirrors bash/zsh).
+	for (const o of globalOptions) {
+		lines.push(`complete -c waf-checker -n __fish_use_subcommand -l ${o.replace(/^--/, '')}`);
+	}
+	for (const c of commands) {
+		const desc = fishSingleQuoteEscape(c.description);
+		lines.push(`complete -c waf-checker -n __fish_use_subcommand -a ${c.name} -d '${desc}'`);
+		for (const o of c.options) {
+			lines.push(`complete -c waf-checker -n '__fish_seen_subcommand_from ${c.name}' -l ${o.replace(/^--/, '')}`);
+		}
+	}
+	return lines.join('\n') + '\n';
+}
+
+// Command: completion — print a shell completion script for bash/zsh/fish
+program
+	.command('completion [shell]')
+	.description('Print a shell completion script (bash, zsh, or fish). Omit <shell> to auto-detect from $SHELL')
+	.addHelpText('after', `
+Examples:
+  waf-checker completion bash > /etc/bash_completion.d/waf-checker
+  echo 'source <(waf-checker completion zsh)' >> ~/.zshrc
+  waf-checker completion fish > ~/.config/fish/completions/waf-checker.fish`)
+	.action((shell: string | undefined) => {
+		let target = (shell || '').toLowerCase();
+		if (!target) {
+			const envShell = (process.env.SHELL || '').split('/').pop() || '';
+			target = COMPLETION_SHELLS.includes(envShell as CompletionShell) ? envShell : '';
+		}
+		if (!COMPLETION_SHELLS.includes(target as CompletionShell)) {
+			console.error(
+				colors.red(
+					`Error: specify a supported shell: ${COMPLETION_SHELLS.join(', ')}${shell ? ` (received: ${shell})` : ' (could not auto-detect from $SHELL)'}.`,
+				),
+			);
+			process.exit(1);
+		}
+		process.stdout.write(generateCompletion(target as CompletionShell));
 	});
 
 export { program };

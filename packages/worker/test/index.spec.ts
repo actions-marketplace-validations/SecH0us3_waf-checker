@@ -71,18 +71,15 @@ describe('WAF Checker API', () => {
 		expect(Array.isArray(data)).toBe(true);
 	});
 
-	it('returns 400 for /api/batch/status without jobId', async () => {
-		const response = await SELF.fetch('https://example.com/api/batch/status');
-		expect(response.status).toBe(400);
-	});
-
-	it('returns 400 for /api/batch/stop without jobId', async () => {
-		const response = await SELF.fetch('https://example.com/api/batch/stop', {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({})
-		});
-		expect(response.status).toBe(400);
+	it('no longer serves the removed server-side batch API', async () => {
+		for (const path of ['/api/batch/start', '/api/batch/status', '/api/batch/stop']) {
+			const response = await SELF.fetch(`https://example.com${path}`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ urls: ['https://example.com'] }),
+			});
+			expect(response.status).toBe(404);
+		}
 	});
 
 	it('returns 405 for /api/virtual-patch with GET request', async () => {
@@ -162,12 +159,36 @@ describe('WAF Checker API', () => {
 		const html = renderReport([
 			{ category: 'SQL Injection', method: 'GET', payload: 'union select', status: 200, responseTime: 120 },
 			{ category: 'Sensitive Files', method: 'GET', payload: '/.git/config', status: 404, responseTime: 95 },
+			{
+				category: 'XSS',
+				method: 'GET',
+				payload: '<script>alert(1)</script>',
+				status: 403,
+				responseTime: 50,
+				ipHeaderBypass: {
+					bypassed: true,
+					tested: 4,
+					hits: [{ header: 'X-Forwarded-For', value: '127.0.0.1', status: 200, verdict: 'passed' }],
+				},
+			},
+			{
+				category: 'Command Injection',
+				method: 'GET',
+				payload: ';id',
+				status: 403,
+				responseTime: 45,
+				baselineNote: 'origin_blocked',
+			},
 		], false);
 		expect(html).toContain('120ms');
 		expect(html).toContain('95ms');
 		expect(html).toContain('btn-outline-danger');
 		expect(html).toContain('btn-outline-warning');
 		expect(html).toContain('showVirtualPatchModal(\'misses\')');
+		expect(html).toContain('Trusted IP Header Allow-List Bypass Detected');
+		expect(html).toContain('IP bypass via X-Forwarded-For: 127.0.0.1');
+		expect(html).toContain('Origin Baseline Returns 403/406');
+		expect(html).toContain('Origin 403');
 	});
 
 	it('handles /api/virtual-patch with includeMisses: true for 404 status vectors', async () => {
@@ -209,11 +230,12 @@ describe('WAF Checker API', () => {
 	});
 
 	it('does NOT refuse URLs merely containing secmy in path or unrelated domain', async () => {
-		const res = await SELF.fetch('https://example.com/api/check?url=https://example.com/secmy-test');
+		// pageSize=1: only the self-scan decision is under test, not a full scan page.
+		const res = await SELF.fetch('https://example.com/api/check?url=https://example.com/secmy-test&pageSize=1');
 		// Should not be 422
 		expect(res.status).not.toBe(422);
 
-		const resIo = await SELF.fetch('https://example.com/api/check?url=https://secmyapp.io/');
+		const resIo = await SELF.fetch('https://example.com/api/check?url=https://secmyapp.io/&pageSize=1');
 		expect(resIo.status).not.toBe(422);
 	});
 
@@ -233,6 +255,32 @@ describe('WAF Checker API', () => {
 			expect(data.results[0]).toHaveProperty('blocked');
 			expect(data.results[0]).toHaveProperty('verdict');
 		}
+	});
+
+	it.each([
+		{ endpoint: 'check', url: 'https://example.com/api/check?url=https://example.com&categories=User-Agent&envelope=1&pageSize=5' },
+		{ endpoint: 'audit', url: 'https://example.com/api/audit?url=https://example.com&categories=SQL Injection&pageSize=5&detectedWAF=' },
+	])('normalizes invalid page values to 0 on /api/$endpoint', async ({ url }) => {
+		for (const invalidPage of ['-1', 'invalid']) {
+			const res = await SELF.fetch(`${url}&page=${invalidPage}`);
+			expect(res.status).toBe(200);
+			const data: any = await res.json();
+			expect(data.page).toBe(0);
+			expect(data.pageSize).toBe(5);
+			expect(data.results.length).toBeGreaterThan(0);
+		}
+	});
+
+	it.each([
+		{ endpoint: 'check', url: 'https://example.com/api/check?url=https://example.com&categories=User-Agent&envelope=1&pageSize=5&page=9999' },
+		{ endpoint: 'audit', url: 'https://example.com/api/audit?url=https://example.com&categories=SQL Injection&pageSize=5&page=9999&detectedWAF=' },
+	])('returns hasMore false and empty results when page is beyond total items on /api/$endpoint', async ({ url }) => {
+		const res = await SELF.fetch(url);
+		expect(res.status).toBe(200);
+		const data: any = await res.json();
+		expect(data.page).toBe(9999);
+		expect(data.results).toEqual([]);
+		expect(data.hasMore).toBe(false);
 	});
 
 	it('exposes confidencePercent and confidenceThreshold on /api/waf-detect', async () => {
@@ -256,5 +304,52 @@ describe('WAF Checker API', () => {
 		expect(data).toHaveProperty('patches');
 		expect(Array.isArray(data.results)).toBe(true);
 		expect(data.patches).toHaveProperty('bundles');
+	});
+
+	it('pages /api/audit and continues with the detected WAF instead of re-detecting', async () => {
+		const base = 'https://example.com/api/audit?url=https://example.com&categories=SQL Injection&pageSize=5';
+		const first: any = await (await SELF.fetch(base)).json();
+		expect(first.page).toBe(0);
+		expect(first.pageSize).toBe(5);
+		expect(first.results).toHaveLength(5);
+		expect(first.total).toBeGreaterThan(5);
+		expect(first.hasMore).toBe(true);
+		expect(first.detection).not.toBeNull();
+		expect(typeof first.detectedWAF).toBe('string');
+
+		const next: any = await (
+			await SELF.fetch(`${base}&page=1&detectedWAF=${encodeURIComponent(first.detectedWAF)}`)
+		).json();
+		expect(next.page).toBe(1);
+		expect(next.detection).toBeNull();
+		expect(next.detectedWAF).toBe(first.detectedWAF);
+		expect(next.total).toBe(first.total);
+		expect(next.results.length).toBeGreaterThan(0);
+	});
+
+	it('reads page, pageSize and detectedWAF from a POST /api/audit body', async () => {
+		const res = await SELF.fetch('https://example.com/api/audit', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ url: 'https://example.com', categories: ['SQL Injection'], page: 1, pageSize: 5, detectedWAF: '' }),
+		});
+		expect(res.status).toBe(200);
+		const data: any = await res.json();
+		expect(data.page).toBe(1);
+		expect(data.pageSize).toBe(5);
+		expect(data.detection).toBeNull();
+		expect(data.results.length).toBeGreaterThan(0);
+	});
+
+	it('gives query parameters precedence over POST body for page and pageSize in /api/audit', async () => {
+		const res = await SELF.fetch('https://example.com/api/audit?page=2&pageSize=3', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ url: 'https://example.com', categories: ['SQL Injection'], page: 1, pageSize: 5, detectedWAF: '' }),
+		});
+		expect(res.status).toBe(200);
+		const data: any = await res.json();
+		expect(data.page).toBe(2);
+		expect(data.pageSize).toBe(3);
 	});
 });

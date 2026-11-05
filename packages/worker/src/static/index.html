@@ -409,6 +409,14 @@
 							<input class="form-check-input" type="checkbox" id="spoofUserAgent" checked />
 							<label class="form-check-label" for="spoofUserAgent" title="Replays blocked (403) requests as trusted bots (Googlebot, Slackbot, ...) to detect User-Agent allow-list bypasses">Legit User-Agent bypass test</label>
 						</div>
+						<div class="form-check">
+							<input class="form-check-input" type="checkbox" id="spoofIpHeaders" checked />
+							<label class="form-check-label" for="spoofIpHeaders" title="Replays blocked (403/406) requests with X-Forwarded-For / X-Real-IP / True-Client-IP to detect trusted proxy IP allow-list bypasses">Trusted IP Header bypass test</label>
+						</div>
+						<div class="form-check">
+							<input class="form-check-input" type="checkbox" id="calibrateBaseline" checked />
+							<label class="form-check-label" for="calibrateBaseline" title="Captures a benign baseline request to distinguish origin 403s from real WAF blocks and detect custom soft-block pages">Baseline Calibration</label>
+						</div>
 						<div class="mt-2 w-100" id="paddingSizeWrapper" style="display: none;">
 							<label for="paddingSizeSelect" class="form-label small text-muted mb-1">Padding Size:</label>
 							<select id="paddingSizeSelect" class="form-select form-select-sm">
@@ -419,6 +427,18 @@
 							</select>
 						</div>
 					</div>
+				</div>
+
+				<!-- Origin IP Override -->
+				<div class="settings-section mb-3">
+					<div class="section-label">🎯 Origin IP Override</div>
+					<input type="text" id="originIp" class="form-control" autocomplete="off" spellcheck="false"
+						placeholder="e.g. 203.0.113.10 or 2001:db8::1" />
+					<small class="text-muted d-block mt-1">
+						Know the real server IP behind the WAF? We keep requesting the domain (so the
+						Host header and TLS stay correct) but resolve it to this IP, to test whether the
+						origin is exposed and reachable past the WAF. Public IPs only.
+					</small>
 				</div>
 
 				<!-- Custom Headers -->

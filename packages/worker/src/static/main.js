@@ -157,14 +157,19 @@ function renderSummary(results, falsePositiveMode = false) {
 		const status_class = getStatusClass(code, parseInt(code, 10) >= 300 && parseInt(code, 10) < 400, falsePositiveMode);
 		html += `<div class='d-flex align-items-left mb-1'><div class='min-width-112'><label><input type='checkbox' class='status-filter-checkbox checkbox-align' data-status='${code}' checked> <b>Status ${code}</b></label></div><div class='status-bar ${status_class}' style='width:${percent.toFixed(2)}%;'>${statusCounter[code]}</div></div>`;
 	}
-	// Legitimate User-Agent bypasses are counted separately: their status is 403
-	// (so they hide inside the green "Status 403" bar), but they are a real
-	// bypass — surface them with their own red indicator + filter.
+	// Legitimate User-Agent and Trusted IP Header bypasses are counted separately:
+	// their status is 403 (so they hide inside the green "Status 403" bar), but
+	// they are a real bypass — surface them with their own red indicator + filter.
 	if (!falsePositiveMode) {
 		const uaBypassCount = results.filter((r) => r.userAgentBypass && r.userAgentBypass.bypassed).length;
 		if (uaBypassCount > 0) {
 			const percent = totalRequests ? (uaBypassCount / totalRequests) * 100 : 0;
 			html += `<div class='d-flex align-items-left mb-1'><div class='min-width-112'><label><input type='checkbox' id='uaBypassFilter' class='ua-bypass-filter-checkbox checkbox-align' checked> <b title='Requests blocked with a normal User-Agent that reached the origin when spoofing a trusted bot'>🕵️ UA bypass</b></label></div><div class='status-bar status-bar-bypass' style='width:${percent.toFixed(2)}%;'>${uaBypassCount}</div></div>`;
+		}
+		const ipBypassCount = results.filter((r) => r.ipHeaderBypass && r.ipHeaderBypass.bypassed).length;
+		if (ipBypassCount > 0) {
+			const percent = totalRequests ? (ipBypassCount / totalRequests) * 100 : 0;
+			html += `<div class='d-flex align-items-left mb-1'><div class='min-width-112'><label><input type='checkbox' id='ipBypassFilter' class='ip-bypass-filter-checkbox checkbox-align' checked> <b title='Requests blocked normally that reached the origin when spoofing trusted proxy IP headers'>🌐 IP bypass</b></label></div><div class='status-bar status-bar-bypass' style='width:${percent.toFixed(2)}%;'>${ipBypassCount}</div></div>`;
 		}
 	}
 	html += `</div>`;
@@ -178,6 +183,21 @@ function renderReport(results, falsePositiveMode = false) {
 	// The test-mode indicator + status legend are rendered as a compact inline
 	// caption directly above the status bars (see renderSummary), instead of a
 	// standalone coloured block, to keep the results header uncluttered.
+
+	// Baseline origin-blocked warning: when benign baseline requests already return 403/406
+	// with an identical body structure, "blocked" results may be origin auth/RBAC rather than WAF.
+	if (!falsePositiveMode) {
+		const originBlockedCount = results.filter((r) => r.baselineNote === 'origin_blocked').length;
+		if (originBlockedCount > 0) {
+			html += `<div class="alert alert-warning d-flex align-items-start gap-2 mb-3" role="alert">
+      <span style="font-size:1.4rem;line-height:1;">⚠️</span>
+      <div>
+        <strong>Origin Baseline Returns 403/406 (${originBlockedCount} inconclusive)</strong>
+        <div class="small mt-1">A benign baseline request returned the same 403/406 response structure as ${originBlockedCount} attack probe(s). The target endpoint likely requires authentication or blocks all unauthenticated traffic at the origin — these responses are not confirmed WAF blocks.</div>
+      </div>
+    </div>`;
+		}
+	}
 
 	// Legitimate User-Agent allow-list bypass alert. Distinct from the virtual-patch
 	// banner: a UA allow-list bypass isn't fixed by a payload regex rule, so it gets
@@ -195,6 +215,22 @@ function renderReport(results, falsePositiveMode = false) {
         <strong>User-Agent Allow-List Bypass Detected (${uaBypasses.length})</strong>
         <div class="small mt-1">${uaBypasses.length} attack request(s) were blocked with a normal User-Agent, but reached the origin once the request claimed to be a trusted bot (${bots}${moreBots}). The WAF (or origin) is trusting a spoofable User-Agent header.</div>
         <div class="small mt-1"><b>Remediation:</b> never allow-list by User-Agent alone — verify legitimate crawlers by reverse-DNS / published IP ranges, and keep WAF rules applied to trusted bots.</div>
+      </div>
+    </div>`;
+		}
+
+		const ipBypasses = results.filter((r) => r.ipHeaderBypass && r.ipHeaderBypass.bypassed);
+		if (ipBypasses.length > 0) {
+			const hdrSet = new Set();
+			ipBypasses.forEach((r) => (r.ipHeaderBypass.hits || []).forEach((h) => hdrSet.add(`${h.header}: ${h.value}`)));
+			const hdrs = Array.from(hdrSet).slice(0, 5).map((n) => escapeHtml(n)).join(', ');
+			const moreHdrs = hdrSet.size > 5 ? `, +${hdrSet.size - 5}` : '';
+			html += `<div class="alert alert-danger d-flex align-items-start gap-2 mb-3" role="alert">
+      <span style="font-size:1.4rem;line-height:1;">🌐</span>
+      <div>
+        <strong>Trusted IP Header Allow-List Bypass Detected (${ipBypasses.length})</strong>
+        <div class="small mt-1">${ipBypasses.length} attack request(s) were blocked normally, but reached the origin when spoofing proxy/forwarding headers (${hdrs}${moreHdrs}). The WAF or reverse proxy trusts client-supplied IP headers.</div>
+        <div class="small mt-1"><b>Remediation:</b> strip or overwrite untrusted forwarding headers (<code>X-Forwarded-For</code>, <code>X-Real-IP</code>, <code>True-Client-IP</code>, etc.) at the edge and only trust proxy headers from verified upstream load-balancer IPs.</div>
       </div>
     </div>`;
 		}
@@ -240,10 +276,10 @@ function renderReport(results, falsePositiveMode = false) {
 		if (falsePositiveMode) {
 			codeClass = r.status == 200 || r.status == '200' ? ' payload-green' : '';
 		} else {
-			codeClass = r.status == 403 || r.status == '403' ? ' payload-green' : '';
+			codeClass = (r.status == 403 || r.status == '403' || r.blocked === true) && r.baselineNote !== 'origin_blocked' ? ' payload-green' : '';
 		}
 		const codeNum = parseInt(r.status, 10);
-		const isBypass = (r.status == 200 || r.status == '200') && !falsePositiveMode;
+		const isBypass = (r.status == 200 || r.status == '200') && r.blocked !== true && !falsePositiveMode;
 		const isMiss = !falsePositiveMode && !isBypass && (codeNum === 404 || (codeNum >= 500 && codeNum < 600));
 		let patchBtn = '';
 		if (isBypass) {
@@ -263,9 +299,6 @@ function renderReport(results, falsePositiveMode = false) {
 			const extra = names.length > 3 ? ` (+${names.length - 3})` : '';
 			const originStatus = hits.length ? hits[0].status : '';
 			const tested = r.userAgentBypass.tested;
-			// Probing stops at the first identity that gets through (subrequest
-			// budget), so `hits` is the first one found, not the full set — the badge
-			// says "via" rather than counting bots, which would always read "1".
 			const title =
 				`Blocked with a normal User-Agent (403), but reached the origin (status ${originStatus}) ` +
 				`when the request claimed to be a trusted bot: ${escapeHtml(names.join(', '))}. ` +
@@ -273,14 +306,36 @@ function renderReport(results, falsePositiveMode = false) {
 			uaBadge = `<span class="badge bg-danger ms-2" title="${title}">🕵️ UA bypass via ${shown}${extra}</span>`;
 			uaAttr = " data-ua-bypass='1'";
 		}
-		const rowClass = uaBadge ? ' class="ua-bypass-row"' : '';
+		let ipBadge = '';
+		let ipAttr = '';
+		if (r.ipHeaderBypass && r.ipHeaderBypass.bypassed) {
+			const hits = r.ipHeaderBypass.hits || [];
+			const names = hits.map((h) => `${h.header}: ${h.value}`);
+			const shown = names.slice(0, 2).map((n) => escapeHtml(n)).join(', ');
+			const extra = names.length > 2 ? ` (+${names.length - 2})` : '';
+			const originStatus = hits.length ? hits[0].status : '';
+			const tested = r.ipHeaderBypass.tested;
+			const title =
+				`Blocked normally, but reached the origin (status ${originStatus}) ` +
+				`when spoofing trusted IP header(s): ${escapeHtml(names.join(', '))}. ` +
+				`Probing stopped at the first bypass${tested ? ` after ${tested} header(s)` : ''}.`;
+			ipBadge = `<span class="badge bg-danger ms-2" title="${title}">🌐 IP bypass via ${shown}${extra}</span>`;
+			ipAttr = " data-ip-bypass='1'";
+		}
+		let baselineBadge = '';
+		if (r.baselineNote === 'origin_blocked') {
+			baselineBadge = `<span class="badge bg-warning text-dark ms-2" title="Matches benign baseline 403/406 response — likely origin authentication/RBAC rather than WAF block">⚠️ Origin 403</span>`;
+		} else if (r.baselineNote === 'custom_block_page') {
+			baselineBadge = `<span class="badge bg-success ms-2" title="Soft-block detected: status ${r.status} returned a WAF security block page">🛡️ Soft Block</span>`;
+		}
+		const rowClass = uaBadge || ipBadge ? ' class="ua-bypass-row"' : '';
 		html +=
-			`<tr data-status='${escapeHtml(String(r.status))}'${uaAttr}${rowClass}>` +
+			`<tr data-status='${escapeHtml(String(r.status))}'${uaAttr}${ipAttr}${rowClass}>` +
 			`<td data-label='Category'>${escapeHtml(String(r.category ?? ''))}</td>` +
 			`<td class='text-center' data-label='Method'>${escapeHtml(String(r.method ?? ''))}</td>` +
 			`<td class='${status_class} text-center' data-label='Status'>${escapeHtml(String(r.status ?? ''))}</td>` +
 			`<td class='text-center' data-label='Response Time'>${escapeHtml(String(responseTime))}ms</td>` +
-			`<td data-label='Payload'><code class='${codeClass}'>${escapeHtml(r.payload)}</code>${patchBtn}${uaBadge}</td>` +
+			`<td data-label='Payload'><code class='${codeClass}'>${escapeHtml(r.payload)}</code>${patchBtn}${uaBadge}${ipBadge}${baselineBadge}</td>` +
 			`</tr>`;
 	}
 	html += `</tbody></table>`;
@@ -481,6 +536,10 @@ function showResultsSkeleton() {
 	el.innerHTML = `<div class="results-skeleton" aria-hidden="true"><div class="sk sk-head"></div>${rows}</div>`;
 }
 
+// Throttling of the results table re-render while a scan is still paging.
+const PROGRESSIVE_RENDER_MIN_INTERVAL_MS = 250;
+const PROGRESSIVE_RENDER_COST_FACTOR = 3;
+
 async function fetchResults() {
 	const btn = document.getElementById('checkBtn');
 	if (!btn) return;
@@ -546,6 +605,13 @@ async function fetchResults() {
 	// requests as Googlebot/Slackbot/etc. to catch User-Agent allow-list bypasses.
 	const spoofUserAgentEl = document.getElementById('spoofUserAgent');
 	const spoofUserAgent = spoofUserAgentEl ? spoofUserAgentEl.checked : true;
+	// Trusted IP Header bypass test (on by default). Replays blocked (403/406)
+	// requests with X-Forwarded-For / X-Real-IP / True-Client-IP.
+	const spoofIpHeadersEl = document.getElementById('spoofIpHeaders');
+	const spoofIpHeaders = spoofIpHeadersEl ? spoofIpHeadersEl.checked : true;
+	// Baseline Calibration (on by default). Captures benign baseline before scanning.
+	const calibrateBaselineEl = document.getElementById('calibrateBaseline');
+	const calibrateBaseline = calibrateBaselineEl ? calibrateBaselineEl.checked : true;
 
 	// --- Save to localStorage ---
 	safeStorage.setItem('wafchecker_url', url);
@@ -562,6 +628,8 @@ async function fetchResults() {
 	safeStorage.setItem('wafchecker_enablePadding', enablePadding ? '1' : '0');
 	safeStorage.setItem('wafchecker_paddingSize', paddingSize);
 	safeStorage.setItem('wafchecker_spoofUserAgent', spoofUserAgent ? '1' : '0');
+	safeStorage.setItem('wafchecker_spoofIpHeaders', spoofIpHeaders ? '1' : '0');
+	safeStorage.setItem('wafchecker_calibrateBaseline', calibrateBaseline ? '1' : '0');
 
 	// --- Get template and headers ---
 	let payloadTemplate = '';
@@ -577,12 +645,24 @@ async function fetchResults() {
 		customHeaders = headersEl.value;
 		safeStorage.setItem('wafchecker_customHeaders', customHeaders);
 	}
+
+	// Origin IP Override: connect to a known origin IP behind the WAF while still
+	// addressing the target by hostname. Empty means no override.
+	let originIp = '';
+	const originIpEl = document.getElementById('originIp');
+	if (originIpEl) {
+		originIp = originIpEl.value.trim();
+		safeStorage.setItem('wafchecker_originIp', originIp);
+	}
 	let page = 0;
 	let allResults = [];
 	let detectedWAFType = window.detectedWAF || null;
 	let wafDetection = null;
+	let cachedBaseline = null;
 	// Set once the up-front detection has answered, whatever it found.
 	let upfrontDetectionDone = false;
+	// Earliest time (performance.now()) the next progressive render may run.
+	let nextRenderAt = 0;
 
 	// Auto-detect WAF first if enabled
 	if (autoDetectWAF && !detectedWAFType) {
@@ -612,6 +692,9 @@ async function fetchResults() {
 				methods: selectedMethods.join(','),
 				categories: selectedCategories.join(','),
 				page: String(page),
+				// Small pages so results stream in: with UA probing a blocked item costs
+				// up to 17 requests, and nothing renders until a page returns. The server
+				// also clamps it to the Worker's per-request subrequest budget.
 				pageSize: '15',
 				followRedirect: followRedirect ? '1' : '0',
 				falsePositiveTest: falsePositiveTest ? '1' : '0',
@@ -627,7 +710,11 @@ async function fetchResults() {
 				enablePadding: enablePadding ? '1' : '0',
 				paddingSize: paddingSize,
 				spoofUserAgent: spoofUserAgent ? '1' : '0',
+				spoofIpHeaders: spoofIpHeaders ? '1' : '0',
+				calibrateBaseline: calibrateBaseline ? '1' : '0',
+				concurrency: spoofUserAgent || spoofIpHeaders ? '2' : '4',
 				detectedWAF: detectedWAFType || '',
+				...(originIp ? { originIp } : {}),
 			});
 			const resp = await fetch(`/api/check?${params.toString()}`, {
 				method: 'POST',
@@ -636,6 +723,8 @@ async function fetchResults() {
 					payloadTemplate,
 					customHeaders,
 					detectedWAF: detectedWAFType,
+					...(originIp ? { originIp } : {}),
+					...(cachedBaseline ? { baseline: cachedBaseline } : {}),
 				}),
 				signal: currentAbortController.signal,
 			});
@@ -651,12 +740,36 @@ async function fetchResults() {
 				requestErrorMsg = parsedMsg;
 				break;
 			}
+			if (!cachedBaseline && resp.headers && typeof resp.headers.get === 'function') {
+				const baselineHdr = resp.headers.get('x-waf-baseline');
+				if (baselineHdr) {
+					try {
+						cachedBaseline = JSON.parse(baselineHdr);
+					} catch { }
+				}
+			}
 			const results = await resp.json();
 			if (!results || !results.length) break;
-			allResults = allResults.concat(results);
+			for (const r of results) allResults.push(r);
 			btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span> Scanning (${allResults.length} done)...`;
-			document.getElementById('results').innerHTML = renderReport(allResults, falsePositiveTest);
-			highlightCategoryCheckboxesByResults(allResults, falsePositiveTest);
+			// Each progressive render rebuilds the whole growing table, so rendering
+			// after every page made the main thread's work quadratic in the result
+			// count. Render at most every PROGRESSIVE_RENDER_MIN_INTERVAL_MS, and wait
+			// at least PROGRESSIVE_RENDER_COST_FACTOR times what the last render cost
+			// (style and layout included) before the next one. The final render after
+			// the loop always shows every result.
+			if (performance.now() >= nextRenderAt) {
+				const renderStart = performance.now();
+				nextRenderAt = Infinity; // until this render's cost is known
+				document.getElementById('results').innerHTML = renderReport(allResults, falsePositiveTest);
+				highlightCategoryCheckboxesByResults(allResults, falsePositiveTest);
+				requestAnimationFrame(() =>
+					setTimeout(() => {
+						const now = performance.now();
+						nextRenderAt = now + Math.max(PROGRESSIVE_RENDER_MIN_INTERVAL_MS, (now - renderStart) * PROGRESSIVE_RENDER_COST_FACTOR);
+					}, 0),
+				);
+			}
 			page++;
 		}
 
@@ -1423,6 +1536,24 @@ function restoreStateFromLocalStorage() {
 		}
 	}
 
+	// Trusted IP Header bypass test (defaults to on when never set)
+	const spoofIpHeaders = safeStorage.getItem('wafchecker_spoofIpHeaders');
+	if (spoofIpHeaders !== null) {
+		const el = document.getElementById('spoofIpHeaders');
+		if (el) {
+			el.checked = spoofIpHeaders === '1';
+		}
+	}
+
+	// Baseline Calibration (defaults to on when never set)
+	const calibrateBaseline = safeStorage.getItem('wafchecker_calibrateBaseline');
+	if (calibrateBaseline !== null) {
+		const el = document.getElementById('calibrateBaseline');
+		if (el) {
+			el.checked = calibrateBaseline === '1';
+		}
+	}
+
 	// Categories
 	const categories = safeStorage.getItem('wafchecker_categories');
 	if (categories) {
@@ -1456,6 +1587,13 @@ function restoreStateFromLocalStorage() {
 	if (customHeaders) {
 		const headersEl = document.getElementById('customHeaders');
 		if (headersEl) headersEl.value = customHeaders;
+	}
+
+	// Origin IP Override
+	const originIp = safeStorage.getItem('wafchecker_originIp');
+	if (originIp) {
+		const originIpEl = document.getElementById('originIp');
+		if (originIpEl) originIpEl.value = originIp;
 	}
 
 	// More Settings panel state
@@ -1863,8 +2001,8 @@ function initApp() {
 				}
 				filterResultsTableByStatus();
 			}
-			// UA-bypass filter toggle
-			if (target && target.classList.contains('ua-bypass-filter-checkbox')) {
+			// UA-bypass or IP-bypass filter toggle
+			if (target && (target.classList.contains('ua-bypass-filter-checkbox') || target.classList.contains('ip-bypass-filter-checkbox'))) {
 				filterResultsTableByStatus();
 			}
 		});
@@ -1884,11 +2022,13 @@ function filterResultsTableByStatus() {
 	const checkedStatuses = Array.from(document.querySelectorAll('.status-filter-checkbox:checked')).map((cb) =>
 		cb.getAttribute('data-status'),
 	);
-	// A UA-bypass row's status is 403, so it would vanish when the user unchecks
+	// A UA-bypass or IP-bypass row's status is 403, so it would vanish when the user unchecks
 	// "Status 403" to focus on problems — exactly when they want to see it. Keep
 	// it visible whenever its own filter is on, regardless of the status filters.
 	const uaFilter = document.getElementById('uaBypassFilter');
 	const uaFilterOn = !uaFilter || uaFilter.checked;
+	const ipFilter = document.getElementById('ipBypassFilter');
+	const ipFilterOn = !ipFilter || ipFilter.checked;
 	const searchEl = document.getElementById('resultsSearch');
 	const term = (searchEl?.value || '').trim().toLowerCase();
 
@@ -1897,7 +2037,8 @@ function filterResultsTableByStatus() {
 	rows.forEach((row) => {
 		const statusVisible = checkedStatuses.includes(row.getAttribute('data-status'));
 		const isUaBypass = row.getAttribute('data-ua-bypass') === '1';
-		const passesStatus = statusVisible || (isUaBypass && uaFilterOn);
+		const isIpBypass = row.getAttribute('data-ip-bypass') === '1';
+		const passesStatus = statusVisible || (isUaBypass && uaFilterOn) || (isIpBypass && ipFilterOn);
 		const passesSearch = !term || row.textContent.toLowerCase().includes(term);
 		if (passesStatus && passesSearch) {
 			row.style.display = '';

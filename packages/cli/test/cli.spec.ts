@@ -54,7 +54,7 @@ vi.mock('../src/report', async () => {
 });
 
 import * as fs from 'fs';
-import { program } from '../src/index';
+import { program, originIpLookup, normalizeOriginIp, getFetch, generateCompletion, collectCommandMeta, COMPLETION_SHELLS, fishSingleQuoteEscape } from '../src/index';
 import * as core from '@waf-checker/core';
 import { writeReport } from '../src/report';
 
@@ -188,6 +188,103 @@ describe('CLI Argument Processing', () => {
 				undefined,
 				expect.any(Object)
 			);
+			expect(exitCode).toBeNull();
+		});
+
+		it('passes a valid --origin-ip through as originIpOverride', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--origin-ip', '8.8.8.8'])
+			).resolves.toBeDefined();
+
+			const opts = (core.handleApiCheckFiltered as any).mock.calls.at(-1).at(-1);
+			expect(opts.originIpOverride).toBe('8.8.8.8');
+			expect(exitCode).toBeNull();
+		});
+
+		it('exits 1 for a private/restricted --origin-ip and never scans', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--origin-ip', '10.0.0.1'])
+			).rejects.toThrow('process.exit(1)');
+
+			expect(exitCode).toBe(1);
+			expect(core.handleApiCheckFiltered).not.toHaveBeenCalled();
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('not a valid public IP'));
+		});
+
+		it('exits 1 when --origin-ip is combined with --proxy', async () => {
+			await expect(
+				program.parseAsync([
+					'node', 'index.js', 'check', 'https://example.com',
+					'--origin-ip', '8.8.8.8', '--proxy', 'http://127.0.0.1:8080',
+				])
+			).rejects.toThrow('process.exit(1)');
+
+			expect(exitCode).toBe(1);
+			expect(core.handleApiCheckFiltered).not.toHaveBeenCalled();
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('cannot be combined with --proxy'));
+		});
+
+		it('--limit caps via pageSize and disables baseline + UA/IP probes for an exact request count', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--limit', '1'])
+			).resolves.toBeDefined();
+			const opts = (core.handleApiCheckFiltered as any).mock.calls.at(-1).at(-1);
+			expect(opts.pageSize).toBe(1);
+			// Every extra request is suppressed so N tests == N requests.
+			expect(opts.spoofUserAgents).toBe(false);
+			expect(opts.spoofIpHeaders).toBe(false);
+			expect(opts.calibrateBaseline).toBe(false);
+			expect(exitCode).toBeNull();
+		});
+
+		it('warns when --limit is combined with --threshold (approximate score)', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--limit', '1', '--threshold', '90'])
+			).resolves.toBeDefined();
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('--threshold gating on a limited run is unreliable'));
+		});
+
+		it('without --limit, probes and baseline stay enabled by default', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com'])
+			).resolves.toBeDefined();
+			const opts = (core.handleApiCheckFiltered as any).mock.calls.at(-1).at(-1);
+			expect(opts.spoofUserAgents).toBe(true);
+			expect(opts.spoofIpHeaders).toBe(true);
+			expect(opts.calibrateBaseline).toBe(true);
+		});
+
+		it('rejects a fractional or garbage-suffixed --limit', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--limit', '1abc'])
+			).rejects.toThrow('process.exit(1)');
+			expect(exitCode).toBe(1);
+			expect(core.handleApiCheckFiltered).not.toHaveBeenCalled();
+		});
+
+		it('--max-requests is an alias for --limit', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--max-requests', '5'])
+			).resolves.toBeDefined();
+			const opts = (core.handleApiCheckFiltered as any).mock.calls.at(-1).at(-1);
+			expect(opts.pageSize).toBe(5);
+		});
+
+		it('exits 1 for a non-positive or non-numeric --limit and never scans', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--limit', '0'])
+			).rejects.toThrow('process.exit(1)');
+			expect(exitCode).toBe(1);
+			expect(core.handleApiCheckFiltered).not.toHaveBeenCalled();
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('must be a positive integer'));
+		});
+
+		it('--insecure warns that TLS verification is disabled but still scans', async () => {
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--insecure'])
+			).resolves.toBeDefined();
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('TLS certificate verification is DISABLED'));
+			expect(core.handleApiCheckFiltered).toHaveBeenCalled();
 			expect(exitCode).toBeNull();
 		});
 
@@ -624,6 +721,64 @@ describe('CLI Argument Processing', () => {
 			expect(logged).toContain('USER-AGENT ALLOW-LIST BYPASSES DETECTED');
 			expect(logged).not.toContain('Perfect Score');
 		});
+
+		it('should pass spoofIpHeaders, calibrateBaseline, and concurrency options to handleApiCheckFiltered', async () => {
+			await expect(
+				program.parseAsync([
+					'node', 'index.js', 'check', 'https://example.com',
+					'--no-spoof-ip',
+					'--no-calibrate-baseline',
+					'--concurrency', '3',
+				])
+			).resolves.toBeDefined();
+
+			const options = vi.mocked(core.handleApiCheckFiltered).mock.calls[0][15];
+			expect(options?.spoofIpHeaders).toBe(false);
+			expect(options?.calibrateBaseline).toBe(false);
+			expect(options?.concurrency).toBe(3);
+		});
+
+		it('should exit with 1 on a Trusted IP header allow-list bypass when --fail-on-bypass is specified', async () => {
+			vi.mocked(core.handleApiCheckFiltered).mockResolvedValueOnce([
+				{
+					status: 403, method: 'GET', payload: 'test', responseTime: 120, category: 'SQL Injection',
+					ipHeaderBypass: { bypassed: true, tested: 4, hits: [{ header: 'X-Forwarded-For', value: '127.0.0.1', status: 200, verdict: 'passed' }] },
+				},
+			]);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com', '--fail-on-bypass'])
+			).rejects.toThrow('process.exit(1)');
+
+			expect(exitCode).toBe(1);
+			expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('Trusted IP header allow-list bypass'));
+		});
+
+		it('should report a Trusted IP header bypass and origin 403 baseline note', async () => {
+			vi.mocked(core.handleApiCheckFiltered).mockResolvedValueOnce([
+				{
+					status: 403, method: 'GET', payload: 'test', responseTime: 120, category: 'SQL Injection',
+					ipHeaderBypass: {
+						bypassed: true, tested: 4,
+						hits: [{ header: 'X-Forwarded-For', value: '127.0.0.1', status: 200, verdict: 'passed' }],
+					},
+				},
+				{
+					status: 403, method: 'GET', payload: 'test2', responseTime: 100, category: 'XSS',
+					blocked: false, baselineNote: 'origin_blocked',
+				},
+			]);
+
+			await expect(
+				program.parseAsync(['node', 'index.js', 'check', 'https://example.com'])
+			).resolves.toBeDefined();
+
+			expect(exitCode).toBeNull();
+			const logged = consoleLogSpy.mock.calls.map((c: any[]) => c.join(' ')).join('\n');
+			expect(logged).toContain('TRUSTED IP HEADER ALLOW-LIST BYPASSES DETECTED');
+			expect(logged).toContain('Origin 403:');
+			expect(logged).not.toContain('Perfect Score');
+		});
 	});
 
 	describe('batch command', () => {
@@ -986,5 +1141,148 @@ describe('CLI Argument Processing', () => {
 			).resolves.toBeDefined();
 			expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('K8S'));
 		});
+	});
+});
+
+describe('Origin IP override helpers', () => {
+	it('normalizeOriginIp strips IPv6 brackets and trims, leaving IPv4 untouched', () => {
+		expect(normalizeOriginIp('[2606:4700:4700::1111]')).toBe('2606:4700:4700::1111');
+		expect(normalizeOriginIp('  8.8.8.8 ')).toBe('8.8.8.8');
+		expect(normalizeOriginIp('2606:4700::1111')).toBe('2606:4700::1111');
+	});
+
+	it('getFetch returns the global fetch when no options are given', () => {
+		expect(getFetch()).toBe(globalThis.fetch);
+		expect(getFetch({})).toBe(globalThis.fetch);
+	});
+
+	it('getFetch returns a custom dispatcher-bound fetch for --insecure', () => {
+		const f = getFetch({ insecure: true });
+		expect(typeof f).toBe('function');
+		expect(f).not.toBe(globalThis.fetch);
+	});
+
+	it('getFetch returns a custom fetch when an origin-IP override is set', () => {
+		const f = getFetch({ originIp: '8.8.8.8', targetHost: 'example.com' });
+		expect(typeof f).toBe('function');
+		expect(f).not.toBe(globalThis.fetch);
+	});
+
+	it('originIpLookup resolves the target host to the override IPv4 with family 4', () => {
+		const lookup = originIpLookup('8.8.8.8', 'example.com');
+		const cb = vi.fn();
+		lookup('example.com', {}, cb);
+		expect(cb).toHaveBeenCalledWith(null, '8.8.8.8', 4);
+	});
+
+	it('originIpLookup resolves IPv6 with family 6 (bare literal, no brackets)', () => {
+		const lookup = originIpLookup('2606:4700:4700::1111', 'example.com');
+		const cb = vi.fn();
+		lookup('example.com', {}, cb);
+		expect(cb).toHaveBeenCalledWith(null, '2606:4700:4700::1111', 6);
+	});
+
+	it('originIpLookup honors the all:true shape used by the connector', () => {
+		const lookup = originIpLookup('8.8.8.8', 'example.com');
+		const cb = vi.fn();
+		lookup('EXAMPLE.COM', { all: true }, cb); // case-insensitive host match
+		expect(cb).toHaveBeenCalledWith(null, [{ address: '8.8.8.8', family: 4 }]);
+	});
+
+	it('originIpLookup delegates a NON-target host to real DNS instead of pinning it', () => {
+		const realLookup = vi.fn();
+		const lookup = originIpLookup('8.8.8.8', 'example.com', realLookup as any);
+		const cb = vi.fn();
+		lookup('api.example.com', { all: true }, cb); // sibling subdomain (e.g. redirect)
+		expect(realLookup).toHaveBeenCalledWith('api.example.com', { all: true }, cb);
+		expect(cb).not.toHaveBeenCalled(); // not force-resolved to the origin IP
+	});
+});
+
+describe('shell completion', () => {
+	let exitCode: number | null = null;
+	let consoleErrorSpy: any;
+	beforeEach(() => {
+		exitCode = null;
+		vi.spyOn(process, 'exit').mockImplementation((code?: number) => {
+			exitCode = code ?? 0;
+			throw new Error(`process.exit(${exitCode})`);
+		});
+		consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+	});
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it('collectCommandMeta captures subcommands and their long options', () => {
+		const meta = collectCommandMeta();
+		const names = meta.commands.map((c) => c.name);
+		expect(names).toEqual(expect.arrayContaining(['detect', 'check', 'batch', 'patch', 'completion']));
+		const check = meta.commands.find((c) => c.name === 'check')!;
+		expect(check.options).toEqual(expect.arrayContaining(['--insecure', '--limit', '--origin-ip', '--help']));
+		expect(meta.globalOptions).toEqual(expect.arrayContaining(['--help', '--version']));
+	});
+
+	it('generates a bash completion that registers the function and lists commands/flags', () => {
+		const out = generateCompletion('bash');
+		expect(out).toContain('complete -F _waf_checker waf-checker');
+		expect(out).toMatch(/check\) opts="[^"]*--insecure[^"]*"/);
+		expect(out).toContain('detect)');
+	});
+
+	it('generates a zsh completion with a #compdef header and compdef registration', () => {
+		const out = generateCompletion('zsh');
+		expect(out.startsWith('#compdef waf-checker')).toBe(true);
+		expect(out).toContain('compdef _waf_checker waf-checker');
+		expect(out).toContain('check) compadd');
+	});
+
+	it('generates fish completion lines for commands and flags', () => {
+		const out = generateCompletion('fish');
+		expect(out).toContain('complete -c waf-checker -n __fish_use_subcommand -a check');
+		expect(out).toContain("complete -c waf-checker -n '__fish_seen_subcommand_from check' -l insecure");
+	});
+
+	it('fishSingleQuoteEscape escapes backslashes before quotes (complete sanitization)', () => {
+		// Backslash must be doubled first, otherwise escaping the quote introduces
+		// an unescaped backslash (the js/incomplete-sanitization pattern).
+		expect(fishSingleQuoteEscape("a'b")).toBe("a\\'b");
+		expect(fishSingleQuoteEscape('a\\b')).toBe('a\\\\b');
+		expect(fishSingleQuoteEscape("a\\'b")).toBe("a\\\\\\'b");
+		expect(fishSingleQuoteEscape('plain text')).toBe('plain text');
+	});
+
+	it('every supported shell produces a non-empty script', () => {
+		for (const sh of COMPLETION_SHELLS) {
+			expect(generateCompletion(sh).length).toBeGreaterThan(50);
+		}
+	});
+
+	it('`completion bash` writes the script to stdout', async () => {
+		const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+		try {
+			await expect(program.parseAsync(['node', 'index.js', 'completion', 'bash'])).resolves.toBeDefined();
+			const out = writeSpy.mock.calls.map((c: any[]) => String(c[0])).join('');
+			expect(out).toContain('complete -F _waf_checker waf-checker');
+		} finally {
+			writeSpy.mockRestore();
+		}
+		expect(exitCode).toBeNull();
+	});
+
+	it('`completion <bad shell>` exits 1', async () => {
+		await expect(
+			program.parseAsync(['node', 'index.js', 'completion', 'notashell'])
+		).rejects.toThrow('process.exit(1)');
+		expect(exitCode).toBe(1);
+		expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('supported shell'));
+	});
+});
+
+describe('version', () => {
+	it('reports a real semver version resolved at runtime (not the old hardcoded 1.4.0)', () => {
+		const v = program.version();
+		expect(v).toMatch(/^\d+\.\d+\.\d+/);
+		expect(v).not.toBe('1.4.0');
 	});
 });

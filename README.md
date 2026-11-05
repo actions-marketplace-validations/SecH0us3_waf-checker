@@ -79,6 +79,10 @@ SQL Injection, XSS, Command Injection, Path Traversal, SSRF, Local File Inclusio
 - Configurable concurrency and delay between requests.
 - Real-time progress tracking.
 
+### 🔀 Regression Diffing (`--compare` / `--fail-on-regression`)
+- Diff a scan against a previously saved JSON report to surface **new bypasses** (previously blocked, now not), **newly blocked** payloads, and added/removed tests.
+- CI gate (`--fail-on-regression`) that fails only on *worsening* WAF posture, not on the full result list — ideal for catching managed-ruleset drift.
+
 ---
 
 ## Project Structure
@@ -119,9 +123,50 @@ To deploy the Worker to Cloudflare:
 npx wrangler deploy --workspace=packages/worker
 ```
 
+The Worker needs the **Workers Paid** plan: scan and audit pages are sized for its 10,000 subrequests per request (`[limits] subrequests` in `wrangler.toml`, `WORKER_SUBREQUEST_LIMIT` in `packages/core/src/check.ts`). The Free plan allows only 50 external subrequests per request: one scan page with the User-Agent bypass test (on by default in the UI) or with redirects followed goes past that.
+
 ### 2. CLI Version (Node.js)
 
-To run security testing audits directly from your command line:
+#### Install it as a global `waf-checker` command (recommended)
+
+After `npm install && npm run build` at the repo root, link the CLI so it runs
+from **any directory** — no `cd` into the repo and no long `node .../dist` paths:
+
+```bash
+# Expose `waf-checker` on your PATH from the built workspace
+npm link --workspace @waf-checker/cli
+# …now, from anywhere:
+waf-checker --help
+waf-checker check https://example.com
+
+# Uninstall later with:
+npm rm -g @waf-checker/cli
+```
+
+The published package bundles its code, so you can also install a packed build
+globally without the repo: `npm pack --workspace @waf-checker/cli` then
+`npm i -g ./waf-checker-cli-*.tgz`.
+
+#### Shell completion (bash / zsh / fish)
+
+`waf-checker completion <shell>` prints a completion script (omit `<shell>` to
+auto-detect from `$SHELL`):
+
+```bash
+# bash
+waf-checker completion bash | sudo tee /etc/bash_completion.d/waf-checker
+# or, without root: echo 'source <(waf-checker completion bash)' >> ~/.bashrc
+
+# zsh (into a directory on your $fpath)
+waf-checker completion zsh > "${fpath[1]}/_waf-checker"
+
+# fish
+waf-checker completion fish > ~/.config/fish/completions/waf-checker.fish
+```
+
+#### Running without a global install
+
+You can always invoke the built entrypoint directly:
 
 ```bash
 # Print general CLI help and usage
@@ -182,6 +227,20 @@ node packages/cli/dist/index.js check https://example.com --threshold 95 -q
 
 # Fail immediately on any detected bypass
 node packages/cli/dist/index.js check https://example.com --fail-on-bypass -q
+```
+
+#### 🔀 Regression Diffing (Scan vs Scan)
+WAF posture drifts over time — a vendor ships a managed-ruleset update, a CRS rule gets disabled, an origin change shifts a verdict. Instead of re-triaging the full result list every run, compare against a previously saved JSON report and gate CI on *worsening* only. A payload that was `blocked` in the baseline report and is no longer blocked counts as a regression; a payload newly blocked counts as an improvement. Matching is by `(category, method, evasion technique, payload)`, and network errors / origin-side blocks are treated as inconclusive so they never show up as false regressions.
+
+```bash
+# Save a known-good baseline report
+node packages/cli/dist/index.js check https://example.com -f json -o baseline.json -q
+
+# Later: diff the current scan against it and print regressions/improvements
+node packages/cli/dist/index.js check https://example.com --compare baseline.json -q
+
+# Fail CI only when a previously-blocked payload is no longer blocked
+node packages/cli/dist/index.js check https://example.com --compare baseline.json --fail-on-regression -q
 ```
 
 #### 🛡️ Virtual Patching & Auto-Remediation
@@ -342,7 +401,7 @@ The Cloudflare Worker exposes a public REST API consumed by scanners and fuzzers
 | `/api/check` | `GET`, `POST` | Probes target with attack payloads. Supports pagination & category filtering. |
 | `/api/virtual-patch` | `POST` | Generates remediation rules for Cloudflare, AWS, ModSec, NGINX, Caddy, HAProxy, Coraza. |
 | `/api/reverse-engineer` | `GET`, `POST` | Reverse engineers OWASP CRS rules, anomaly thresholds, and body limits. |
-| `/api/audit` | `GET`, `POST` | **Unified 1-request audit**: executes detection, security checks, and virtual patches. |
+| `/api/audit` | `GET`, `POST` | **Unified audit**: executes detection, security checks, and virtual patches, usually in one request (see Audit Paging). |
 
 ### Key Integration Features
 
@@ -358,6 +417,9 @@ The Cloudflare Worker exposes a public REST API consumed by scanners and fuzzers
   }
   ```
   *(Omit `?envelope=1` to receive the default bare JSON array for backwards compatibility).*
+
+- **Audit Paging (`/api/audit`)**:
+  An audit returns everything in one response (`hasMore: false`) unless its plan exceeds what one Cloudflare Worker request's subrequest budget allows (1658 items). That covers no detected WAF (513 items) and every WAF's bypass variations up to Sophos (1321); a Qrator-protected target (2441 items) comes back over two pages, as does any audit where you pass a smaller `pageSize`. Responses carry `page`, `pageSize`, `total`, `hasMore` and `detectedWAF` (`""` if none was found). While `hasMore` is true, request `page=<page + 1>&detectedWAF=<detectedWAF>`; passing `detectedWAF` back skips re-detection (`detection` is then `null`) and keeps page boundaries stable. `patches` covers that response's results; for one bundle over several pages, `POST` the combined `results` to `/api/virtual-patch`.
 
 - **Normalized Confidence (`/api/waf-detect`)**:
   Provides `confidencePercent` (0–100) alongside raw `confidence` and `confidenceThreshold` (`40`).

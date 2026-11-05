@@ -40,24 +40,44 @@ export function processCustomHeaders(customHeadersStr: string, payload?: string)
 }
 
 /**
+ * Deterministic pseudo-random generator seeded from a string (FNV-1a hash
+ * feeding mulberry32). The same seed always yields the same sequence, which
+ * lets a paged scan randomize a payload identically on every page.
+ */
+export function seededRandom(seed: string): () => number {
+	let state = 0x811c9dc5;
+	for (let i = 0; i < seed.length; i++) {
+		state = Math.imul(state ^ seed.charCodeAt(i), 0x01000193);
+	}
+	return () => {
+		state = (state + 0x6d2b79f5) | 0;
+		let t = Math.imul(state ^ (state >>> 15), 1 | state);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/**
  * Helper function to randomly uppercase characters in a string
  */
-export function randomUppercase(str: string): string {
-	let result = '';
-	for (let i = 0; i < str.length; i++) {
-		const char = str[i];
+export function randomUppercase(str: string, random: () => number = Math.random): string {
+	// Flip the case of each ASCII letter with probability 1/2. `random` is called
+	// once per ASCII letter and for nothing else, in order, so a seeded generator
+	// yields the same casing as before. Works on code units in a typed array
+	// rather than matching a regex and appending per character.
+	const n = str.length;
+	const units = new Uint16Array(n);
+	for (let i = 0; i < n; i++) {
+		const code = str.charCodeAt(i);
+		const isLetter = (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 		// Randomly uppercase 50% of alphabetic characters
-		if (char.match(/[a-zA-Z]/) && Math.random() > 0.5) {
-			if (char === char.toLowerCase()) {
-				result += char.toUpperCase();
-			} else {
-				result += char.toLowerCase();
-			}
-		} else {
-			result += char;
-		}
+		units[i] = isLetter && random() > 0.5 ? code ^ 0x20 : code;
 	}
-	return result;
+	let out = '';
+	for (let i = 0; i < n; i += 4096) {
+		out += String.fromCharCode.apply(null, units.subarray(i, i + 4096) as unknown as number[]);
+	}
+	return out;
 }
 
 /**
